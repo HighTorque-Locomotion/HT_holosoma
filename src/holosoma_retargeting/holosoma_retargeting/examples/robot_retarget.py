@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal
@@ -43,6 +44,12 @@ from holosoma_retargeting.src.utils import (  # noqa: E402
     preprocess_motion_data,
     transform_from_human_to_world,
     transform_y_up_to_z_up,
+)
+from holosoma_retargeting.data_utils.parc_ms import (  # noqa: E402
+    create_scaled_terrain_assets,
+    create_terrain_scene_xml,
+    load_parc_ms_positions,
+    parc_ms_clip_paths,
 )
 
 # Configure logging
@@ -150,8 +157,8 @@ def validate_config(cfg: RetargetingConfig) -> None:
         )
 
     # Task-specific format requirements
-    if cfg.task_type == "climbing" and cfg.data_format not in (None, "mocap"):
-        raise ValueError("Climbing task requires 'mocap' data format")
+    if cfg.task_type == "climbing" and cfg.data_format not in (None, "mocap", "parc_ms"):
+        raise ValueError("Climbing task requires 'mocap' or 'parc_ms' data format")
     if cfg.task_type == "object_interaction" and cfg.data_format not in (None, "smplh"):
         raise ValueError("Object interaction requires 'smplh' data format")
     # robot_only accepts any format in the registry (already validated above)
@@ -263,6 +270,46 @@ def load_motion_data(
 
     elif task_type == "climbing":
         task_dir = data_path / task_name
+        if data_format == "parc_ms":
+            # Prefer a converted NPZ when one is explicitly placed beside the
+            # clip; otherwise read the original PARC MS pickle directly.
+            npz_candidates = [
+                task_dir / f"{task_name}.npz",
+                data_path / f"{task_name}.npz",
+            ]
+            npz_file = next((p for p in npz_candidates if p.is_file()), None)
+            if npz_file is not None:
+                with np.load(npz_file, allow_pickle=False) as data:
+                    if "global_joint_positions" not in data:
+                        raise ValueError(f"{npz_file}: missing global_joint_positions")
+                    human_joints = np.asarray(data["global_joint_positions"], dtype=np.float32)
+                    human_height = float(
+                        np.asarray(data["height"] if "height" in data.files else 1.70).item()
+                    )
+                    _fps = float(np.asarray(data["fps"] if "fps" in data.files else 30.0).item())
+                if human_joints.ndim != 3 or human_joints.shape[-1] != 3:
+                    raise ValueError(
+                        f"{npz_file}: global_joint_positions must have shape (T,J,3), "
+                        f"got {human_joints.shape}"
+                    )
+                _meta = {"source_npz": str(npz_file)}
+                source_motion_file = npz_file
+            else:
+                pkl_file, _terrain_file = parc_ms_clip_paths(data_path, task_name)
+                human_joints, _fps, _meta = load_parc_ms_positions(pkl_file)
+                human_height = motion_data_config.default_human_height or 1.70
+                source_motion_file = pkl_file
+            num_frames = human_joints.shape[0]
+            object_poses = np.tile(np.array([[1, 0, 0, 0, 0, 0, 0]]), (num_frames, 1))
+            smpl_scale = constants.ROBOT_HEIGHT / max(human_height, 1e-6)
+            logger.debug(
+                "Loaded PARC MS clip %s: %d frames, fps=%.2f, scale=%.4f",
+                source_motion_file,
+                num_frames,
+                _fps,
+                smpl_scale,
+            )
+            return human_joints, object_poses, smpl_scale
         npy_files = list(task_dir.glob("*.npy"))
         if not npy_files:
             raise FileNotFoundError(f"No .npy file found in {task_dir}")
@@ -292,6 +339,7 @@ def setup_object_data(
     task_config: TaskConfig,
     augmentation: bool,
     object_scale_augmented: np.ndarray | None = None,
+    data_format: str = "",
 ) -> tuple[np.ndarray | None, np.ndarray | None, str | None]:
     """Setup object-specific data (ground, object mesh, climbing terrain).
     Args:
@@ -329,10 +377,78 @@ def setup_object_data(
         if object_dir is None:
             raise ValueError("object_dir must be provided for climbing task")
 
+        if data_format == "parc_ms":
+            # PARC MS provides a terrain OBJ rather than the multi-box URDF
+            # used by the bundled climbing examples.  Keep the source OBJ for
+            # interaction-mesh sampling, create a uniformly scaled collision
+            # copy for MuJoCo, and add it to the supplied robot XML.
+            terrain_files = sorted(object_dir.glob("*_terrain.obj"))
+            if len(terrain_files) != 1:
+                raise FileNotFoundError(
+                    f"Expected exactly one *_terrain.obj in {object_dir}, found {len(terrain_files)}"
+                )
+            terrain_src = terrain_files[0]
+            robot_xml_file = getattr(constants, "ROBOT_XML_FILE", None)
+            if not robot_xml_file:
+                raise ValueError(
+                    "PARC MS climbing requires --robot-config.robot-xml-file so "
+                    "the terrain can be attached to the robot scene"
+                )
+            robot_xml_path = Path(robot_xml_file).expanduser().resolve()
+            if not robot_xml_path.is_file():
+                raise FileNotFoundError(f"Robot MuJoCo XML not found: {robot_xml_path}")
+
+            object_scale = (
+                np.asarray(object_scale_augmented, dtype=np.float64).reshape(3)
+                if augmentation and object_scale_augmented is not None
+                else np.ones(3, dtype=np.float64)
+            )
+            scaled_terrain_obj, terrain_urdf = create_scaled_terrain_assets(
+                terrain_src,
+                object_dir,
+                smpl_scale * float(object_scale[0]),
+                z_scale=float(object_scale[2] / max(object_scale[0], 1e-12)),
+            )
+            scene_xml_path = robot_xml_path.parent / (
+                f"{robot_xml_path.stem}_with_parc_ms_{object_dir.name}.xml"
+            )
+            constants.OBJECT_MESH_FILE = str(terrain_src)
+            constants.OBJECT_URDF_FILE = str(terrain_urdf)
+            constants.SCENE_XML_FILE = str(
+                create_terrain_scene_xml(robot_xml_path, scaled_terrain_obj, scene_xml_path)
+            )
+
+            object_local_pts, object_local_pts_demo_original = load_object_data(
+                str(terrain_src),
+                smpl_scale=smpl_scale,
+                sample_count=100,
+            )
+            if augmentation:
+                object_local_pts_demo = object_local_pts_demo_original * object_scale
+                object_local_pts = object_local_pts_demo
+            else:
+                object_local_pts_demo = object_local_pts_demo_original
+                object_local_pts = object_local_pts_demo_original
+            return object_local_pts, object_local_pts_demo, str(terrain_urdf)
+
         # Setup climbing-specific object
         box_asset_xml = object_dir / "box_assets.xml"
-        scene_xml_name = Path(constants.ROBOT_URDF_FILE).name.replace(".urdf", f"_w_{constants.OBJECT_NAME}.xml")
-        scene_xml_file = object_dir / scene_xml_name
+        # Keep generated scene names tied to the MuJoCo model actually loaded.
+        # This matters for robots whose URDF is a ``*_raw.urdf`` source while
+        # the usable MuJoCo model has a different basename.
+        robot_xml_file = getattr(constants, "ROBOT_XML_FILE", None)
+        # A caller may provide an already assembled/scaled scene (for example
+        # ``*_w_multi_boxes_scaled_0.38_0.38_0.38.xml``).  In that case use it
+        # directly instead of appending another ``_w_multi_boxes`` suffix.
+        provided_scene = Path(robot_xml_file) if robot_xml_file else None
+        if provided_scene is not None and provided_scene.exists() and "_w_multi_boxes_scaled_" in provided_scene.stem:
+            scene_xml_file = provided_scene
+            use_provided_scene = True
+        else:
+            scene_stem = Path(robot_xml_file).stem if robot_xml_file else Path(constants.ROBOT_URDF_FILE).stem
+            scene_xml_name = f"{scene_stem}_w_{constants.OBJECT_NAME}.xml"
+            scene_xml_file = object_dir / scene_xml_name
+            use_provided_scene = False
         # Set SCENE_XML_FILE in constants BEFORE creating retargeter (needed for temp_retargeter)
         constants.SCENE_XML_FILE = str(scene_xml_file)
 
@@ -364,9 +480,13 @@ def setup_object_data(
         # Create scaled URDF and XML files
         scale_factors = tuple(float(value) for value in (object_scale * smpl_scale))
         object_urdf_file = create_scaled_multi_boxes_urdf(constants.OBJECT_URDF_FILE, scale_factors)
-        object_asset_xml_path = create_scaled_multi_boxes_xml(str(box_asset_xml), scale_factors)
-        new_scene_xml_path = create_new_scene_xml_file(str(scene_xml_file), scale_factors, object_asset_xml_path)
-        constants.SCENE_XML_FILE = new_scene_xml_path
+        if use_provided_scene:
+            # The supplied scene already references a scaled box asset.
+            constants.SCENE_XML_FILE = str(scene_xml_file)
+        else:
+            object_asset_xml_path = create_scaled_multi_boxes_xml(str(box_asset_xml), scale_factors)
+            new_scene_xml_path = create_new_scene_xml_file(str(scene_xml_file), scale_factors, object_asset_xml_path)
+            constants.SCENE_XML_FILE = new_scene_xml_path
 
         return object_local_pts, object_local_pts_demo, object_urdf_file
 
@@ -419,7 +539,11 @@ def _compute_q_init_base(
         _, human_quat_init = transform_from_human_to_world(
             human_joints[0, 0, :], object_poses[0], np.array([0.0, 0.0, 0.0])
         )
-        spine_joint_idx = retargeter.demo_joints.index("Spine1")
+        # Bundled MOCAP uses ``Spine1``; PARC MS uses the canonical ``torso``
+        # body.  Both are the upper-pelvis/root reference for initializing the
+        # robot floating base.
+        spine_name = "Spine1" if "Spine1" in retargeter.demo_joints else "torso"
+        spine_joint_idx = retargeter.demo_joints.index(spine_name)
         # MuJoCo order: pos first, then quat
         q_init_base = np.concatenate(
             [
@@ -621,15 +745,15 @@ def main(cfg: RetargetingConfig) -> None:
 
     # Ensure configs match top-level selections
     if cfg.robot_config.robot_type != robot:
-        cfg.robot_config = RobotConfig(robot_type=robot)
+        # Preserve explicit URDF/XML/height/foot-link overrides when the
+        # top-level robot selector changes the nested config's robot type.
+        cfg.robot_config = replace(cfg.robot_config, robot_type=robot)
 
     if cfg.motion_data_config.robot_type != robot or cfg.motion_data_config.data_format != data_format:
-        cfg.motion_data_config = MotionDataConfig(data_format=data_format, robot_type=robot)
+        cfg.motion_data_config = replace(cfg.motion_data_config, data_format=data_format, robot_type=robot)
 
     # Task-specific object setup: set default object_dir for climbing if not provided
     if task_type == "climbing" and cfg.task_config.object_dir is None:
-        from dataclasses import replace
-
         cfg.task_config = replace(cfg.task_config, object_dir=data_path / task_name)
 
     constants = create_task_constants(
@@ -656,6 +780,7 @@ def main(cfg: RetargetingConfig) -> None:
         cfg.task_config,
         cfg.augmentation,
         object_scale_augmented=_OBJECT_SCALE_AUGMENTED,
+        data_format=data_format,
     )
 
     # Create retargeter

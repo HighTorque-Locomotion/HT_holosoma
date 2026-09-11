@@ -84,6 +84,11 @@ def find_files(data_dir: Path, data_format: str, object_name: str | None = None)
         # MOCAP: .npy files in subdirectories
         files = [str(p) for p in data_dir.glob("*/*.npy")]
         return sorted(files)
+    if data_format == "parc_ms":
+        # PARC MS: one pickle per clip directory; the loader validates that
+        # the matching ``*_terrain.obj`` sidecar is present.
+        files = [str(p) for p in data_dir.glob("*/*.pkl")]
+        return sorted(files)
     if data_format == "smplx":
         # SMPL-X: .npz files in root directory
         files = [str(p) for p in data_dir.glob("*.npz")]
@@ -214,6 +219,7 @@ def process_single_task(args):
                 task_config,
                 augmentation=(k > 0),
                 object_scale_augmented=aug_config["scale"],
+                data_format=data_format,
             )
         else:
             object_local_pts, object_local_pts_demo, object_urdf_path = setup_object_data(
@@ -223,6 +229,7 @@ def process_single_task(args):
                 smpl_scale,
                 task_config,
                 augmentation=(k > 0),
+                data_format=data_format,
             )
 
         # Create retargeter

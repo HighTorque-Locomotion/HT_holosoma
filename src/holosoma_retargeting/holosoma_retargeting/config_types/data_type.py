@@ -10,6 +10,7 @@ from holosoma_retargeting.config_types.robot import (
     _default_robot_defaults,
     _validate_robot_type,
 )
+from holosoma_retargeting.data_utils.parc_ms import PARC_MS_DEMO_JOINTS as _PARC_MS_DEMO_JOINTS
 
 # Pre-defined constants for each data format
 LAFAN_DEMO_JOINTS = [
@@ -173,6 +174,11 @@ SMPLX_DEMO_JOINTS = [
     "R_Wrist",
 ]
 
+# PARC MS uses a compact 15-body humanoid (plus two toe points synthesized by
+# ``data_utils.parc_ms``).  Names intentionally follow the source rig so the
+# same data can be inspected in human-humanoid-tools and Holosoma.
+PARC_MS_DEMO_JOINTS = _PARC_MS_DEMO_JOINTS
+
 # Joint mappings - organized by (data_format, robot_type)
 JOINTS_MAPPINGS = {
     ("lafan", "g1"): {
@@ -294,6 +300,71 @@ JOINTS_MAPPINGS = {
         "LeftFoot": "Ankle_Cross_Left",
         "RightFoot": "Ankle_Cross_Right",
     },
+    # PiPlus S (22 DoF).  The fixed-wrist model still has a hand/palm marker
+    # near the end of the wrist mesh.  For the feet, ``LeftFoot``/``RightFoot``
+    # must be the ankle-pitch hinge centres (the G1 reference bodies are fixed
+    # hinge-centre markers, not points that rotate with ankle pitch).
+    ("mocap", "piplus_s"): {
+        # Use the fixed torso-center marker rather than the full torso mesh.
+        # This is the PiPlus equivalent of G1's pelvis_contour_link marker.
+        "Spine1": "torso_center_link",
+        "LeftUpLeg": "l_hip_pitch_link",
+        "LeftLeg": "l_calf_link",
+        "LeftFoot": "l_ankle_intermediate_1_link",
+        "LeftToeBase": "l_foot_contact_toe",
+        "RightUpLeg": "r_hip_pitch_link",
+        "RightLeg": "r_calf_link",
+        "RightFoot": "r_ankle_intermediate_1_link",
+        "RightToeBase": "r_foot_contact_toe",
+        "LeftArm": "l_shoulder_roll_link",
+        "LeftForeArm": "l_elbow_link",
+        # The source G1 marker is the palm sphere centre.  PiPlus has the
+        # corresponding palm sphere at the distal end of the fixed wrist;
+        # mapping to the wrist body origin is about 11 cm too proximal.
+        "LeftHandMiddle3": "l_hand_center_link",
+        "RightArm": "r_shoulder_roll_link",
+        "RightForeArm": "r_elbow_link",
+        "RightHandMiddle3": "r_hand_center_link",
+    },
+    # PARC MS (15-body rig + synthetic left_toe/right_toe points).
+    ("parc_ms", "g1"): {
+        "pelvis": "pelvis_contour_link",
+        "torso": "torso_link",
+        "right_upper_arm": "right_shoulder_roll_link",
+        "right_lower_arm": "right_elbow_link",
+        "right_hand": "right_sphere_hand_link",
+        "left_upper_arm": "left_shoulder_roll_link",
+        "left_lower_arm": "left_elbow_link",
+        "left_hand": "left_sphere_hand_link",
+        "right_thigh": "right_hip_pitch_link",
+        "right_shin": "right_knee_link",
+        "right_foot": "right_ankle_intermediate_1_link",
+        "right_toe": "right_ankle_roll_sphere_5_link",
+        "left_thigh": "left_hip_pitch_link",
+        "left_shin": "left_knee_link",
+        "left_foot": "left_ankle_intermediate_1_link",
+        "left_toe": "left_ankle_roll_sphere_5_link",
+    },
+    ("parc_ms", "piplus_s"): {
+        "pelvis": "base_link",
+        # Match the compact PARC torso point to the same fixed marker used by
+        # MOCAP.  The marker has no DoF and is visual-only in the MuJoCo XML.
+        "torso": "torso_center_link",
+        "right_upper_arm": "r_shoulder_roll_link",
+        "right_lower_arm": "r_elbow_link",
+        "right_hand": "r_hand_center_link",
+        "left_upper_arm": "l_shoulder_roll_link",
+        "left_lower_arm": "l_elbow_link",
+        "left_hand": "l_hand_center_link",
+        "right_thigh": "r_hip_pitch_link",
+        "right_shin": "r_calf_link",
+        "right_foot": "r_ankle_pitch_link",
+        "right_toe": "r_foot_contact_toe",
+        "left_thigh": "l_hip_pitch_link",
+        "left_shin": "l_calf_link",
+        "left_foot": "l_ankle_pitch_link",
+        "left_toe": "l_foot_contact_toe",
+    },
 }
 
 # Data format specific constants
@@ -302,6 +373,7 @@ TOE_NAMES_BY_FORMAT = {
     "smplh": ["L_Toe", "R_Toe"],
     "mocap": ["LeftToeBase", "RightToeBase"],
     "smplx": ["L_Foot", "R_Foot"],
+    "parc_ms": ["left_toe", "right_toe"],
 }
 
 
@@ -318,6 +390,11 @@ DATA_FORMAT_CONSTANTS: dict[str, FormatConstants] = {
     "mocap": {
         "default_human_height": 1.78,
     },
+    # PARC's ankle-terminated source rig represents a canonical adult human;
+    # use the same 1.70 m assumption as human-humanoid-tools.
+    "parc_ms": {
+        "default_human_height": 1.70,
+    },
 }
 
 # Unified registry: Maps format name to demo joints
@@ -328,6 +405,7 @@ DEMO_JOINTS_REGISTRY: dict[str, list[str]] = {
     "smplh": SMPLH_DEMO_JOINTS,
     "mocap": MOCAP_DEMO_JOINTS,
     "smplx": SMPLX_DEMO_JOINTS,
+    "parc_ms": PARC_MS_DEMO_JOINTS,
 }
 
 # Type alias for data formats - use str to allow dynamic data formats via DEMO_JOINTS_REGISTRY

@@ -85,6 +85,7 @@ class InteractionMeshRetargeter:
         """
 
         self.robot_model_path = task_constants.ROBOT_URDF_FILE
+        self.robot_xml_path = getattr(task_constants, "ROBOT_XML_FILE", None)
         self.object_model_path = object_urdf_path
         self.object_name = task_constants.OBJECT_NAME
         self.collision_detection_threshold = collision_detection_threshold
@@ -116,11 +117,15 @@ class InteractionMeshRetargeter:
 
         # Load Mujoco model
         if self.object_name == "ground":
-            robot_xml_path = self.robot_model_path.replace(".urdf", ".xml")
+            robot_xml_path = self.robot_xml_path or self.robot_model_path.replace(".urdf", ".xml")
         elif self.object_name == "multi_boxes":
             robot_xml_path = self.task_constants.SCENE_XML_FILE
         else:
-            robot_xml_path = self.robot_model_path.replace(".urdf", "_w_" + self.object_name + ".xml")
+            robot_xml_path = (
+                self.robot_xml_path.replace(".xml", "_w_" + self.object_name + ".xml")
+                if self.robot_xml_path
+                else self.robot_model_path.replace(".urdf", "_w_" + self.object_name + ".xml")
+            )
 
         self.robot_model = mujoco.MjModel.from_xml_path(robot_xml_path)
         print("Loading robot model from: ", robot_xml_path)
@@ -142,7 +147,14 @@ class InteractionMeshRetargeter:
         # Create complete limits with floating base (-inf, inf) and actuated joint limits
         n_floating_base = 7
         joint_names = [self.robot_model.joint(i).name for i in range(self.robot_model.njnt)]
-        actuated_joints = [(i, name) for i, name in enumerate(joint_names) if name]  # Filter out None names
+        # MuJoCo's free joint contributes 7 qpos values but is not an
+        # actuated scalar joint.  Some URDF converters give it a name (e.g.
+        # PiPlus), so filtering only on ``name`` shifts all limits by one.
+        actuated_joints = [
+            (i, name)
+            for i, name in enumerate(joint_names)
+            if name and self.robot_model.jnt_type[i] != mujoco.mjtJoint.mjJNT_FREE
+        ]
 
         large_number = 1e6
         complete_lower_limits = np.concatenate(
@@ -417,7 +429,12 @@ class InteractionMeshRetargeter:
             q_locked_list = np.zeros((num_frames, self.nq))
             q_locked_list[0, self.q_a_indices] = q_a_init
 
-        q_locked_list[:, -7:] = object_poses_augmented
+        # Only dynamic objects have a 7-DoF free joint appended to robot
+        # qpos.  Climbing scenes use static box bodies (their poses are baked
+        # into the scene XML), so writing object_poses into ``q_locked_list``
+        # there would overwrite the robot's last seven joints.
+        if self.has_dynamic_object:
+            q_locked_list[:, -7:] = object_poses_augmented
         q = np.copy(q_locked_list[0])
         retargeted_motions = [q]
 
@@ -644,6 +661,8 @@ class InteractionMeshRetargeter:
 
         # Constraints list
         constraints = []
+        nonpenetration_constraints = []
+        object_nonpenetration_constraints = []
 
         # Linear equality
         constraints += [cp.Constant(J_L[:, self.q_a_indices]) @ dqa - lap_var == -lap0_vec]
@@ -669,8 +688,11 @@ class InteractionMeshRetargeter:
                     raise ValueError("foot_sticking must include one left* and one right* key")
 
                 for key, J_WF in J_WF_dict.items():
-                    apply_left = ("left" in key) and foot_sticking[left_key]
-                    apply_right = ("right" in key) and foot_sticking[right_key]
+                    key_lower = key.lower()
+                    is_left = ("left" in key_lower) or key_lower.startswith("l_")
+                    is_right = ("right" in key_lower) or key_lower.startswith("r_")
+                    apply_left = is_left and foot_sticking[left_key]
+                    apply_right = is_right and foot_sticking[right_key]
                     if apply_left or apply_right:
                         p_lb = p_WF_t_last_dict[key] - p_WF_dict[key] - self.foot_sticking_tolerance
                         p_ub = p_lb + 2 * self.foot_sticking_tolerance  # symmetric window
@@ -701,7 +723,11 @@ class InteractionMeshRetargeter:
             Ja_n_full = Js[key]
             Ja_n = Ja_n_full[self.q_a_indices]
             rhs = -phi - self.penetration_tolerance
-            constraints += [Ja_n @ dqa >= rhs]
+            c_nonpen = Ja_n @ dqa >= rhs
+            constraints += [c_nonpen]
+            nonpenetration_constraints.append(c_nonpen)
+            if self.object_name in self._geom_names[key[0]] or self.object_name in self._geom_names[key[1]]:
+                object_nonpenetration_constraints.append(c_nonpen)
 
         # Self-collision constraints
         Js_sc, phis_sc = self._compute_self_collision_constraints(frame_idx)
@@ -759,6 +785,27 @@ class InteractionMeshRetargeter:
             constraints = [c for c in constraints if not isinstance(c, cp.constraints.second_order.SOC)]
             problem = cp.Problem(cp.Minimize(cp.sum(obj_terms)), constraints)
             problem.solve(solver=cp.CLARABEL, **solver_kwargs)
+
+        # A single late frame can become infeasible when a mesh contact and a
+        # hard foot/joint constraint are simultaneously active.  Prefer a
+        # useful retargeted trajectory over aborting the whole sequence: first
+        # relax object non-penetration (the boxes are static in climbing), then
+        # fall back to dropping all collision constraints as a last resort.
+        if problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE) and object_nonpenetration_constraints:
+            object_ids = {id(c) for c in object_nonpenetration_constraints}
+            relaxed = [c for c in constraints if id(c) not in object_ids]
+            problem = cp.Problem(cp.Minimize(cp.sum(obj_terms)), relaxed)
+            problem.solve(solver=cp.CLARABEL, **solver_kwargs)
+            if problem.status in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
+                print(f"[Retargeter] Warning: relaxed object non-penetration at frame {frame_idx}")
+
+        if problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE) and nonpenetration_constraints:
+            nonpen_ids = {id(c) for c in nonpenetration_constraints}
+            relaxed = [c for c in constraints if id(c) not in nonpen_ids]
+            problem = cp.Problem(cp.Minimize(cp.sum(obj_terms)), relaxed)
+            problem.solve(solver=cp.CLARABEL, **solver_kwargs)
+            if problem.status in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
+                print(f"[Retargeter] Warning: relaxed collision constraints at frame {frame_idx}")
 
         if problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
             raise RuntimeError(f"CVXPY solve failed: {problem.status}")
@@ -1063,9 +1110,9 @@ class InteractionMeshRetargeter:
             nhat_BA_W = np.sign(dist) * (v / norm_v)
         # Degenerate: points coincide. Heuristics fallback.
         # If one side is a plane/ground, use its known normal.
-        elif "ground" in geom2_name.lower():
+        elif self._is_ground_geom_name(geom2_name):
             nhat_BA_W = np.array([0.0, 0.0, 1.0]) * (1.0 if dist >= 0 else -1.0)
-        elif "ground" in geom1_name.lower():
+        elif self._is_ground_geom_name(geom1_name):
             nhat_BA_W = np.array([0.0, 0.0, -1.0]) * (1.0 if dist >= 0 else -1.0)
         else:
             nhat_BA_W = np.array([0.0, 0.0, 0.0])
@@ -1077,6 +1124,17 @@ class InteractionMeshRetargeter:
         Jc = J_bodyA - J_bodyB
 
         return nhat_BA_W @ Jc
+
+    @staticmethod
+    def _is_ground_geom_name(name: str) -> bool:
+        """Return whether a MuJoCo geom name denotes the ground plane.
+
+        Climbing scenes use ``name=\"floor\"`` while robot-only scenes may use
+        ``name=\"ground\"``.  Both must be treated as ground for collision
+        filtering and for the degenerate plane-contact Jacobian fallback.
+        """
+        name_lower = (name or "").lower()
+        return "ground" in name_lower or "floor" in name_lower
 
     def _prefilter_pairs_with_mj_collision(self, threshold: float):
         m, d = self.robot_model, self.robot_data
@@ -1129,16 +1187,23 @@ class InteractionMeshRetargeter:
                 return False
             if contype[g2] == 0 and conaff[g2] == 0:
                 return False
-            if self.object_name in self._geom_names[g1] and "ground" in self._geom_names[g2]:
+            if self.object_name in self._geom_names[g1] and self._is_ground_geom_name(self._geom_names[g2]):
                 return False
-            if "ground" in self._geom_names[g1] and self.object_name in self._geom_names[g2]:
+            if self._is_ground_geom_name(self._geom_names[g1]) and self.object_name in self._geom_names[g2]:
                 return False
-            return (
+            has_object = (
                 self.object_name in self._geom_names[g1]
                 or self.object_name in self._geom_names[g2]
-                or "ground" in self._geom_names[g1]
-                or "ground" in self._geom_names[g2]
             )
+            # Ground may be named either ``ground`` or ``floor`` depending on
+            # the generated scene XML.
+            has_ground = self._is_ground_geom_name(self._geom_names[g1]) or self._is_ground_geom_name(
+                self._geom_names[g2]
+            )
+            # Object non-penetration is optional; ground non-penetration is
+            # still retained so disabling this option does not allow the
+            # robot to fall through the floor.
+            return has_ground or (self.activate_obj_non_penetration and has_object)
 
         for g1, g2 in candidates:
             # Optional: keep your own filters here (e.g., skip object-ground, only keep interaction with object/ground)
@@ -1246,11 +1311,17 @@ class InteractionMeshRetargeter:
         # ---- remaining hinge/slide joints: v = qdot ----
         for j in range(1, self.robot_model.njnt):
             jt = self.robot_model.jnt_type[j]
-            if jt in (mujoco.mjtJoint.mjJNT_HINGE, mujoco.mjtJoint.mjJNT_SLIDE):
+            # ``jnt_type`` is a numpy.int32 array; membership testing against
+            # MuJoCo enum values does not reliably match, so compare integer
+            # values explicitly.
+            if int(jt) in (
+                int(mujoco.mjtJoint.mjJNT_HINGE),
+                int(mujoco.mjtJoint.mjJNT_SLIDE),
+            ):
                 qa = self.robot_model.jnt_qposadr[j]
                 da = self.robot_model.jnt_dofadr[j]
                 T[da, qa] = 1.0
-            elif jt == mujoco.mjtJoint.mjJNT_BALL:
+            elif int(jt) == int(mujoco.mjtJoint.mjJNT_BALL):
                 raise NotImplementedError("BALL joint block not implemented.")
 
         return T

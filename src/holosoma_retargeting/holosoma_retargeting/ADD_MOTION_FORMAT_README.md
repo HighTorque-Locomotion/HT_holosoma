@@ -2,6 +2,66 @@
 
 This guide shows you how to add a new data format (e.g., "myformat") to the retargeting pipeline. We use SMPLX as an example, which is already implemented.
 
+### PARC MS support
+
+This repository now includes a `parc_ms` adapter based on the PARC MS reader in
+`human-humanoid-tools`.  A complete clip must have this layout:
+
+```text
+<dataset-root>/<clip>/<clip>.pkl
+<dataset-root>/<clip>/<clip>_terrain.obj
+```
+
+The adapter reconstructs the canonical 15-body PARC humanoid with forward
+kinematics, synthesizes left/right toe contact points, and attaches a scaled
+terrain mesh to the supplied robot MuJoCo XML.  For collision checking, the
+non-convex terrain mesh is kept visual-only and replaced by per-heightfield-cell
+box geoms; this avoids MuJoCo's convex-hull approximation lifting the robot off
+the flat parts of the terrain.  It then calls the existing
+`InteractionMeshRetargeter`; no `human-humanoid-tools` Python import is required
+at runtime.
+
+Example:
+
+```bash
+python examples/robot_retarget.py \
+  --data_path /path/to/parc_ms_selected \
+  --task-type climbing \
+  --task-name climbing_up_down_terrain_001_aug017_dm_aug5 \
+  --data_format parc_ms \
+  --robot piplus_s \
+  --robot-config.robot-urdf-file models/PiPlus_S_12L8A0G2H0W_SSE_ZedMini_260831/urdf/PiPlus_S_12L8A0G2H0W_SSE_ZedMini_260831_raw.urdf \
+  --robot-config.robot-xml-file models/PiPlus_S_12L8A0G2H0W_SSE_ZedMini_260831/xml/PiPlus_S_12L8A0G2H0W_SSE_ZedMini_260831.xml \
+  --task-config.object-name multi_boxes \
+  --save-dir demo_results/piplus_s/climbing/parc_ms
+```
+
+To export only the converted `global_joint_positions` representation:
+
+```bash
+python -m holosoma_retargeting.data_utils.convert_parc_ms \
+  --input /path/to/clip/clip.pkl \
+  --output /tmp/clip.npz
+```
+
+### PiPlus qpos to Holosoma WBT
+
+Resample retargeted PiPlus qpos to the policy control rate before computing FK
+and velocities.  For the default Holosoma WBT configuration this is 50 Hz:
+
+```bash
+python -m holosoma_retargeting.data_utils.convert_piplus_to_holosoma \
+  /path/to/retargeted_mapping.npz \
+  /path/to/motion_holosoma_fps50.npz \
+  --model-xml /path/to/PiPlus_S_12L8A0G2H0W_Soccer_New.xml \
+  --output-fps 50
+```
+
+Root translation and joint angles are linearly interpolated; root orientation
+uses quaternion SLERP. FK and all finite-difference velocities are recomputed
+after resampling. This preserves the original duration and avoids playing a
+30 FPS source clip at 50 frames per second during training.
+
 ### Overview
 
 1. **Prepare your data** (prepare .npz files which contain global joint positions and human height information)

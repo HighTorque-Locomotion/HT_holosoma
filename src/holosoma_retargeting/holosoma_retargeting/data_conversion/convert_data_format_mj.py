@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Tuple, cast
@@ -72,7 +73,7 @@ def create_task_constants(
     else:
         namespace.OBJECT_URDF_FILE = namespace.ROBOT_URDF_FILE
         namespace.OBJECT_MESH_FILE = ""
-        namespace.SCENE_XML_FILE = namespace.ROBOT_URDF_FILE.replace(".urdf", ".xml")
+        namespace.SCENE_XML_FILE = namespace.ROBOT_XML_FILE
 
     return namespace
 
@@ -381,7 +382,7 @@ def run_simulator(args_cli: DataConversionConfig):
         object_name = "largebox" if has_dynamic_object else None
 
     if args_cli.robot_config.robot_type != args_cli.robot:
-        robot_config = RobotConfig(robot_type=args_cli.robot)
+        robot_config = replace(args_cli.robot_config, robot_type=args_cli.robot)
     else:
         robot_config = args_cli.robot_config
 
@@ -389,7 +390,8 @@ def run_simulator(args_cli: DataConversionConfig):
         args_cli.motion_data_config.robot_type != args_cli.robot
         or args_cli.motion_data_config.data_format != args_cli.data_format
     ):
-        motion_config = MotionDataConfig(
+        motion_config = replace(
+            args_cli.motion_data_config,
             data_format=args_cli.data_format,
             robot_type=args_cli.robot,
         )
@@ -406,13 +408,14 @@ def run_simulator(args_cli: DataConversionConfig):
     object_name = constants.OBJECT_NAME
     robot_model_path = constants.ROBOT_URDF_FILE
     if object_name == "ground":
-        robot_xml_path = robot_model_path.replace(".urdf", ".xml")
+        robot_xml_path = getattr(constants, "ROBOT_XML_FILE", robot_model_path.replace(".urdf", ".xml"))
     elif object_name == "multi_boxes":
         robot_xml_path = constants.SCENE_XML_FILE
     else:
         if object_name is None:
             raise ValueError("object_name cannot be None when it's not 'ground' or 'multi_boxes'")
-        robot_xml_path = robot_model_path.replace(".urdf", "_w_" + object_name + ".xml")
+        base_xml_path = getattr(constants, "ROBOT_XML_FILE", robot_model_path.replace(".urdf", ".xml"))
+        robot_xml_path = base_xml_path.replace(".xml", "_w_" + object_name + ".xml")
 
     robot = mujoco.MjModel.from_xml_path(robot_xml_path)
     robot_data = mujoco.MjData(robot)

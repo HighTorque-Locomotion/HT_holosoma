@@ -89,8 +89,12 @@ def make_player(
         robot_base_frame=robot_root,
         motion_sequence=qpos,
         robot_dof=robot_dof,
-        viser_object=vo if config.assume_object_in_qpos else None,
-        object_base_frame=object_root if config.assume_object_in_qpos else None,
+        # A static terrain/object still needs to be registered with the
+        # playback controller.  ``assume_object_in_qpos`` only controls
+        # whether its 7-D pose is read from the tail of each qpos frame; when
+        # false, viser_utils keeps the object at the identity pose.
+        viser_object=vo,
+        object_base_frame=object_root if vo is not None else None,
         contains_object_in_qpos=config.assume_object_in_qpos,
         initial_fps=actual_fps,
         initial_interp_mult=config.visual_fps_multiplier,
@@ -99,7 +103,8 @@ def make_player(
     n_frames = int(qpos.shape[0])
     print(
         f"[viser_player] Loaded {n_frames} frames | robot_dof={robot_dof} | "
-        f"object={'yes' if (config.object_urdf and config.assume_object_in_qpos) else 'no'}"
+        f"object={'yes' if vo is not None else 'no'} "
+        f"(qpos_pose={'yes' if config.assume_object_in_qpos else 'no'})"
     )
     print("Open the viewer URL printed above. Close the process (Ctrl+C) to exit.")
     return server

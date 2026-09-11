@@ -18,6 +18,11 @@ class RobotDefaults(TypedDict):
 _ROBOT_DEFAULTS: dict[str, RobotDefaults] = {
     "g1": {"robot_dof": 29, "robot_height": 1.32, "object_name": "ground"},
     "t1": {"robot_dof": 23, "robot_height": 1.2, "object_name": "ground"},
+    # PiPlus S model supplied in HT/ht_urdf.  The model has 22 actuated
+    # revolute joints (the torso and wrists are fixed) and a height of about
+    # 0.67 m in the provided MuJoCo model.  Users can override the paths and
+    # height from the CLI for their local installation.
+    "piplus_s": {"robot_dof": 22, "robot_height": 0.674, "object_name": "ground"},
 }
 
 
@@ -71,6 +76,7 @@ class RobotConfig:
     robot_height: float | None = None
     robot_name: str | None = None
     robot_urdf_file: str | None = None
+    robot_xml_file: str | None = None
 
     # Joint definitions (optional overrides)
     foot_sticking_links: list[str] | None = None
@@ -121,9 +127,27 @@ class RobotConfig:
         """Get robot URDF file path."""
         if self.robot_urdf_file is not None:
             return self.robot_urdf_file
+        if self.robot_type == "piplus_s":
+            return (
+                "models/PiPlus_S_12L8A0G2H0W_SSE_ZedMini_260831/urdf/"
+                "PiPlus_S_12L8A0G2H0W_SSE_ZedMini_260831_raw.urdf"
+            )
         return f"models/{self.robot_type}/{self.robot_type}_{self.ROBOT_DOF}dof.urdf"
 
     ROBOT_URDF_FILE = property(_robot_urdf_file, doc="Get robot URDF file path.")
+
+    def _robot_xml_file(self) -> str:
+        """Get MuJoCo XML path (may live outside the URDF directory)."""
+        if self.robot_xml_file is not None:
+            return self.robot_xml_file
+        if self.robot_type == "piplus_s":
+            return (
+                "models/PiPlus_S_12L8A0G2H0W_SSE_ZedMini_260831/xml/"
+                "PiPlus_S_12L8A0G2H0W_SSE_ZedMini_260831.xml"
+            )
+        return self.ROBOT_URDF_FILE.replace(".urdf", ".xml")
+
+    ROBOT_XML_FILE = property(_robot_xml_file, doc="Get MuJoCo XML file path.")
 
     def _foot_sticking_links(self) -> list[str]:
         """Get foot sticking links - use override if provided, else use robot_type default."""
@@ -153,6 +177,17 @@ class RobotConfig:
                 "right_foot_sphere_4_link",
                 "left_foot_sphere_5_link",
                 "right_foot_sphere_5_link",
+            ]
+        if self.robot_type == "piplus_s":
+            return [
+                "l_foot_contact_front_outer",
+                "r_foot_contact_front_outer",
+                "l_foot_contact_rear_outer",
+                "r_foot_contact_rear_outer",
+                "l_foot_contact_front_inner",
+                "r_foot_contact_front_inner",
+                "l_foot_contact_rear_inner",
+                "r_foot_contact_rear_inner",
             ]
         raise ValueError(f"Invalid robot type: {self.robot_type}")
 
