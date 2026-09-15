@@ -46,6 +46,8 @@ class RobotControlConfig:
     clip_actions: bool
     clip_torques: bool
     action_scales_by_effort_limit_over_p_gain: bool = False
+    clip_position_targets_to_joint_limits: bool = False
+    """Clamp position-control set-points to the robot's hard joint limits."""
 
 
 @dataclass(frozen=True)
@@ -65,6 +67,13 @@ class RobotAssetConfig:
     fix_base_link: bool
     mesh_root: str | None = None
     disable_gravity: bool | None = None
+    self_collision_filter_pairs: tuple[tuple[str, str], ...] = ()
+    """Pairs of robot link names whose mutual collision is disabled.
+
+    This keeps articulation self-collision enabled while suppressing contacts
+    between selected neighboring collision approximations that overlap by
+    construction.
+    """
 
     link_physics: PhysicsConfig | None = None
     """Shared physics applied to all robot links (``body_names='.*'``) via the same ``PhysicsConfig``

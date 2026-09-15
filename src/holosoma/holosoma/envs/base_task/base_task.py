@@ -235,6 +235,12 @@ class BaseTask:
         self.simulator.set_actor_root_state_tensor_robots(env_ids, self.simulator.robot_root_states)
         self.simulator.set_dof_state_tensor_robots(env_ids, self.simulator.dof_state)
 
+        # Some tasks reset directly into a reference pose which differs from
+        # the robot's configured default pose.  Give them a chance to keep that
+        # pose during the zero-action bootstrap step below, while preserving a
+        # zero action in the policy observation/history.
+        self._prepare_initial_control_step(env_ids)
+
         actions = torch.zeros(self.num_envs, self.dim_actions, device=self.device, requires_grad=False)
         actor_state = {}
         actor_state["actions"] = actions
@@ -422,10 +428,7 @@ class BaseTask:
 
     def _fill_extras(self, env_ids):
         """Populate per-episode extras after a reset."""
-        if self.reward_manager is None:
-            return
-
-        reward_extras = self.reward_manager.reset(env_ids)
+        reward_extras = self.reward_manager.reset(env_ids) if self.reward_manager is not None else {}
 
         # Normalise extras dictionary to contain (possibly empty) sub-sections.
         self.extras["episode"] = reward_extras.get("episode", {})
@@ -433,7 +436,24 @@ class BaseTask:
         self.extras["raw_episode"] = reward_extras.get("raw_episode", {})
         self.extras["raw_episode_all"] = reward_extras.get("raw_episode_all", {})
 
+        # These 0/1 values are emitted only for completed environments.
+        # LoggingHelper averages them over completed episodes, giving the
+        # fraction of episodes in which each reason fired.
+        if self.termination_manager is not None:
+            for term_name, result in self.termination_manager.term_dones.items():
+                self.extras["episode"][f"termination_{term_name}_fraction"] = (
+                    result[env_ids].detach().float().clone()
+                )
+
         self.extras["time_outs"] = self.time_out_buf
+
+    def _prepare_initial_control_step(self, env_ids):
+        """Prepare actuator targets for ``reset_all``'s bootstrap step.
+
+        The default implementation leaves the ordinary zero-action behavior
+        unchanged.  Reference-tracking tasks may override this hook when their
+        reset pose is not the configured default pose.
+        """
 
     ###########################################################################
     # Simulation loop helpers
@@ -484,6 +504,13 @@ class BaseTask:
         self._check_termination()
         self._compute_reward()
         self._update_log_dict()
+
+        # Episode extras are event data, not persistent environment state.
+        # Clear the previous step before optionally filling them for the
+        # environments that terminate below; otherwise reset statistics are
+        # counted repeatedly on steps with no resets.
+        for section in ("episode", "episode_all", "raw_episode", "raw_episode_all"):
+            self.extras[section] = {}
 
         env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
         final_obs_dict = {}

@@ -71,6 +71,34 @@ terrain_load_obj = TERRAIN_REGISTRY.add(
     ),
 )
 
+terrain_piplus_climb_25 = TERRAIN_REGISTRY.add(
+    "terrain_piplus_climb_25",
+    TerrainManagerCfg(
+        terrain_term=TerrainTermCfg(
+            func="holosoma.managers.terrain.terms.locomotion:TerrainLocomotion",
+            static_friction=1.0,
+            dynamic_friction=1.0,
+            restitution=0.0,
+            mesh_type=MeshType.LOAD_OBJ,
+            obj_file_path="holosoma/data/motions/piplus_s/whole_body_tracking/climb_25_z_scale_1.0_terrain.obj",
+        )
+    ),
+)
+
+terrain_piplus_climb_23 = TERRAIN_REGISTRY.add(
+    "terrain_piplus_climb_23",
+    TerrainManagerCfg(
+        terrain_term=TerrainTermCfg(
+            func="holosoma.managers.terrain.terms.locomotion:TerrainLocomotion",
+            static_friction=1.0,
+            dynamic_friction=1.0,
+            restitution=0.0,
+            mesh_type=MeshType.LOAD_OBJ,
+            obj_file_path="holosoma/data/motions/piplus_s/whole_body_tracking/climb_23_z_scale_1.0_terrain.obj",
+        )
+    ),
+)
+
 from holosoma.utils.config_registry import (  # noqa: E402
     deprecated_defaults_alias as _deprecated_defaults_alias,
 )

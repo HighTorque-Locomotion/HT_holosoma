@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import time
-
 import torch
-
 from holosoma.envs.base_task.base_task import BaseTask
 
 # from holosoma.envs.legged_base_task.legged_robot_base import LeggedRobotBase
@@ -78,12 +75,30 @@ class WholeBodyTrackingManager(BaseTask):
         motion_command = self.command_manager.get_state("motion_command")
         motion_command.update_metrics()
         self.log_dict.update(motion_command.metrics)
+        # TensorAverageMeterDict averages these masks across all environments
+        # and rollout steps, producing a per-step trigger rate in TensorBoard.
+        for term_name, result in self.termination_manager.term_dones.items():
+            self.log_dict[f"termination/{term_name}_rate_per_step"] = result.detach().float()
+        self.log_dict["termination/any_rate_per_step"] = self.reset_buf.detach().bool().float()
 
     def reset_all(self):
         # If reset_all is called several times, clear buffer in motion_command
         motion_command = self.command_manager.get_state("motion_command")
         motion_command.init_buffers()
         return super().reset_all()
+
+    def _prepare_initial_control_step(self, env_ids):
+        """Hold the sampled motion pose through ``reset_all``'s zero-action step.
+
+        A WBT reset writes the robot into a motion frame, which can be far from
+        ``default_dof_pos``.  Without this hold, the bootstrap zero action asks
+        a position controller to jump back to the default pose for one control
+        frame before the policy gets its first observation/action.
+        """
+        for _term_name, term in self.action_manager.iter_terms():
+            hold_reset_pose = getattr(term, "hold_reset_pose_for_next_control_frame", None)
+            if callable(hold_reset_pose):
+                hold_reset_pose(env_ids)
 
     def _reset_robot_states_callback(self, env_ids, target_states=None):
         # TODO(jchen): Now,reset robot/object states is implemented in command/terms/wbt.MotionCommand.reset
@@ -195,14 +210,19 @@ class WholeBodyTrackingManager(BaseTask):
 
     def step_visualize_motion(self, actions):
         motion_command = self.command_manager.get_state("motion_command")
-        dt = 1.0 / float(motion_command.motion.fps)
         motion_command.step()
-        print("time_steps: ", motion_command.time_steps[0].item())
-        self._draw_debug_vis()
+        frame = motion_command.time_steps[0].item()
+        if frame % 50 == 0:
+            print("time_steps: ", frame)
+        # Headless replay still uses this kinematic stepping helper for smoke
+        # tests and dataset checks, but visualization markers only exist when a
+        # viewer was created.
+        if self.viewer:
+            self._draw_debug_vis()
 
         # set root_states_from_motion_command
         root_pos = motion_command.root_pos_w.clone()
-        root_ori = motion_command.root_quat_w.clone()  # wxyz
+        root_ori = motion_command.root_quat_w.clone()  # xyzw (Holosoma convention)
         root_lin_vel = motion_command.body_lin_vel_w[:, 0].clone()
         root_ang_vel = motion_command.body_ang_vel_w[:, 0].clone()
 
@@ -239,7 +259,5 @@ class WholeBodyTrackingManager(BaseTask):
         self.simulator.sim.forward()
         self.simulator.sim.render()
         self.simulator.refresh_sim_tensors()
-
-        time.sleep(dt)
 
         return motion_command.time_steps[0].item() >= motion_command.motion.time_step_total - 2

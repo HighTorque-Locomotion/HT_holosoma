@@ -10,6 +10,7 @@ from holosoma.config_values.wbt.g1.experiment import (
     g1_29dof_wbt_fast_sac_w_object,
     g1_29dof_wbt_w_object,
 )
+from holosoma.config_values.wbt.piplus_s.experiment import piplus_s_wbt
 from holosoma.utils.config_registry import ConfigRegistry
 
 EXPERIMENT_REGISTRY = ConfigRegistry(ExperimentConfig, group="holosoma.config.experiment")
@@ -22,6 +23,7 @@ EXPERIMENT_REGISTRY.add("g1_29dof_wbt", g1_29dof_wbt)
 EXPERIMENT_REGISTRY.add("g1_29dof_wbt_w_object", g1_29dof_wbt_w_object)
 EXPERIMENT_REGISTRY.add("g1_29dof_wbt_fast_sac", g1_29dof_wbt_fast_sac)
 EXPERIMENT_REGISTRY.add("g1_29dof_wbt_fast_sac_w_object", g1_29dof_wbt_fast_sac_w_object)
+EXPERIMENT_REGISTRY.add("piplus_s_wbt", piplus_s_wbt)
 
 
 def get_annotated_experiment_config() -> type:

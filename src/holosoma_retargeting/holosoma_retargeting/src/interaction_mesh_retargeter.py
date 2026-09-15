@@ -663,6 +663,7 @@ class InteractionMeshRetargeter:
         constraints = []
         nonpenetration_constraints = []
         object_nonpenetration_constraints = []
+        foot_sticking_constraints = []
 
         # Linear equality
         constraints += [cp.Constant(J_L[:, self.q_a_indices]) @ dqa - lap_var == -lap0_vec]
@@ -698,10 +699,12 @@ class InteractionMeshRetargeter:
                         p_ub = p_lb + 2 * self.foot_sticking_tolerance  # symmetric window
 
                         Jxy = J_WF[:2, self.q_a_indices]  # (2 x nq_act)
-                        constraints += [
+                        foot_constraints = [
                             Jxy @ dqa >= p_lb[:2],
                             Jxy @ dqa <= p_ub[:2],
                         ]
+                        constraints += foot_constraints
+                        foot_sticking_constraints += foot_constraints
 
             # Foot lock windows: pin Z to floor within configured frame ranges
             if apply_foot_lock:
@@ -799,6 +802,19 @@ class InteractionMeshRetargeter:
             if problem.status in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
                 print(f"[Retargeter] Warning: relaxed object non-penetration at frame {frame_idx}")
 
+        # Foot sticking is a hard XY equality window.  At a frame where the
+        # incoming pose is already in contact/penetration, it can conflict
+        # with the hard self-collision or terrain constraints.  Preserve the
+        # collision constraints and relax only foot sticking as a fallback so
+        # the trajectory can continue instead of failing the whole clip.
+        if problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE) and foot_sticking_constraints:
+            foot_ids = {id(c) for c in foot_sticking_constraints}
+            relaxed = [c for c in constraints if id(c) not in foot_ids]
+            problem = cp.Problem(cp.Minimize(cp.sum(obj_terms)), relaxed)
+            problem.solve(solver=cp.CLARABEL, **solver_kwargs)
+            if problem.status in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
+                print(f"[Retargeter] Warning: relaxed foot-sticking constraints at frame {frame_idx}")
+
         if problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE) and nonpenetration_constraints:
             nonpen_ids = {id(c) for c in nonpenetration_constraints}
             relaxed = [c for c in constraints if id(c) not in nonpen_ids]
@@ -808,7 +824,12 @@ class InteractionMeshRetargeter:
                 print(f"[Retargeter] Warning: relaxed collision constraints at frame {frame_idx}")
 
         if problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
-            raise RuntimeError(f"CVXPY solve failed: {problem.status}")
+            raise RuntimeError(
+                f"CVXPY solve failed: {problem.status} at frame {frame_idx} "
+                f"(nonpenetration={len(nonpenetration_constraints)}, "
+                f"self-collision={len(phis_sc)}, "
+                f"foot-sticking={len(foot_sticking_constraints)})"
+            )
 
         dqa_star = dqa.value
         cost = problem.value
@@ -1386,6 +1407,11 @@ class InteractionMeshRetargeter:
 
         for name, link_name in links.items():
             body_id = mujoco.mj_name2id(self.robot_model, mujoco.mjtObj.mjOBJ_BODY, link_name)
+            if body_id == -1:
+                raise ValueError(
+                    f"Mapped body '{link_name}' for reference '{name}' was not found "
+                    "in the MuJoCo robot model"
+                )
 
             if point_offsets is not None:
                 pC_B = point_offsets

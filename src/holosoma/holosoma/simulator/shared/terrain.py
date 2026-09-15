@@ -79,6 +79,13 @@ class Terrain(TerrainInterface):
             f"[INFO] Loaded terrain mesh from obj file with {len(base.vertices)} vertices and {len(base.faces)} faces"
         )
 
+        # Keep the un-tiled source mesh around.  IsaacSim places environments on
+        # InteractiveScene's own (usually much wider) grid, so its terrain must
+        # be replicated at those actual world origins instead of using the
+        # legacy 10x20 terrain grid below.  Other backends continue to use the
+        # legacy tiled mesh returned here.
+        self._load_obj_base_mesh = base.copy()
+
         gap = 1e-4  # keeps tiles “kissing” without intersecting
         stride = (base.bounds[1] - base.bounds[0]) + gap
 
@@ -90,6 +97,55 @@ class Terrain(TerrainInterface):
                 tiles.append(tile)
 
         return trimesh.util.concatenate(tiles)
+
+    def layout_load_obj_at_origins(self, env_origins: np.ndarray) -> trimesh.Trimesh:
+        """Replicate a loaded OBJ tile at explicit world environment origins.
+
+        IsaacSim's ``InteractiveScene`` computes a separate grid of origins from
+        ``scene.env_spacing`` and does not use the origins sampled by the shared
+        terrain manager.  Calling this method before the IsaacSim terrain prim is
+        authored keeps collision geometry and robot placement in the same frame.
+
+        Parameters
+        ----------
+        env_origins:
+            Array of shape ``(num_envs, 3)`` containing world-space origins.
+
+        Returns
+        -------
+        trimesh.Trimesh
+            The combined mesh, with one copy of the source OBJ per origin.
+        """
+        if self._type != "load_obj":
+            raise ValueError("layout_load_obj_at_origins() is only valid for load_obj terrains")
+
+        base = getattr(self, "_load_obj_base_mesh", None)
+        if base is None:
+            raise RuntimeError("The source OBJ mesh was not retained during terrain initialization")
+
+        origins = np.asarray(env_origins, dtype=np.float64)
+        if origins.ndim != 2 or origins.shape[1] != 3:
+            raise ValueError(f"env_origins must have shape (N, 3), got {origins.shape}")
+        if origins.shape[0] == 0:
+            raise ValueError("env_origins must contain at least one environment origin")
+
+        # With env_spacing=0 (used by some co-located WBT scenes), many scene
+        # entries are identical.  One static mesh is sufficient for all of
+        # them; duplicating coincident collision geometry only wastes memory and
+        # can create redundant contact pairs.
+        mesh_origins = np.unique(origins, axis=0)
+        tiles = []
+        for origin in mesh_origins:
+            tile = base.copy()
+            tile.apply_translation(origin)
+            tiles.append(tile)
+
+        self._load_obj_scene_origins = origins.copy()
+        self._mesh = trimesh.util.concatenate(tiles)
+        # Invalidate the legacy grid cache: its bounds no longer describe one
+        # compact 10x20 grid after the explicit per-environment layout.
+        self._load_obj_origin_grid = None
+        return self._mesh
 
     def _initialize_terrain_config(self) -> trimesh.Trimesh:
         terrain_config = self._cfg.terrain_config
@@ -141,6 +197,10 @@ class Terrain(TerrainInterface):
 
     def sample_env_origins(self) -> np.ndarray:
         if self._type == "load_obj":
+            scene_origins = getattr(self, "_load_obj_scene_origins", None)
+            if scene_origins is not None:
+                indices = np.random.randint(0, len(scene_origins), (self._num_robots,))
+                return scene_origins[indices]
             origin_grid = self._get_load_obj_env_origin_grid()
         else:
             origin_grid = self._env_origins
@@ -157,6 +217,12 @@ class Terrain(TerrainInterface):
         return self._mesh
 
     def _get_load_obj_env_origin_grid(self) -> np.ndarray:
+        scene_origins = getattr(self, "_load_obj_scene_origins", None)
+        if scene_origins is not None:
+            # Explicit IsaacSim layout is a flat list rather than the legacy
+            # (rows, cols) terrain grid.  Keep a compatible 3-D view for any
+            # caller that only needs deterministic origin_grid[0, 0].
+            return np.asarray(scene_origins, dtype=np.float32).reshape(1, -1, 3)
         grid = getattr(self, "_load_obj_origin_grid", None)
         if grid is None:
             grid = self._build_load_obj_env_origin_grid()

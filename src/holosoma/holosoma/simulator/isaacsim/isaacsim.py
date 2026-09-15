@@ -17,8 +17,8 @@ import isaaclab.terrains as terrain_gen
 import isaacsim.core.utils.stage as stage_utils
 import omni.log
 import torch
-from pxr import Usd, UsdGeom
-from isaaclab.actuators import IdealPDActuatorCfg
+from pxr import Sdf, Usd, UsdGeom, UsdPhysics
+from isaaclab.actuators import IdealPDActuatorCfg, ImplicitActuatorCfg
 from isaaclab.assets import Articulation, ArticulationCfg
 from isaaclab.envs import ViewerCfg, mdp
 from isaaclab.managers import EventManager, SceneEntityCfg
@@ -95,9 +95,45 @@ def _hide_prim_subtree(stage: "Usd.Stage", prim_path: str) -> None:
             imageable.MakeInvisible()
 
 
+def _apply_self_collision_filter_pairs(
+    stage: "Usd.Stage", robot_prim_path: str, filter_pairs: tuple[tuple[str, str], ...]
+) -> None:
+    """Disable collision between selected pairs of links on one robot instance.
+
+    The relationship is authored on ``env_0`` before Isaac Lab clones the
+    environments, so all clones inherit the same pair filters without an
+    O(num_envs) USD editing loop. Filtering link prims includes their nested
+    collision shapes while leaving collisions with every other link and the
+    terrain enabled.
+    """
+    for link_a, link_b in filter_pairs:
+        prim_a = stage.GetPrimAtPath(f"{robot_prim_path}/{link_a}")
+        prim_b = stage.GetPrimAtPath(f"{robot_prim_path}/{link_b}")
+        if not prim_a.IsValid() or not prim_b.IsValid():
+            missing = [
+                name
+                for name, prim in ((link_a, prim_a), (link_b, prim_b))
+                if not prim.IsValid()
+            ]
+            raise RuntimeError(
+                "Cannot apply robot self-collision filter; link prim(s) not found under "
+                f"'{robot_prim_path}': {', '.join(missing)}"
+            )
+
+        filter_api = UsdPhysics.FilteredPairsAPI.Apply(prim_a)
+        filter_api.CreateFilteredPairsRel().AddTarget(Sdf.Path(prim_b.GetPath()))
+        logger.info(f"Filtered robot self-collision pair: {link_a} <-> {link_b}")
+
+
 class IsaacSim(BaseSimulator):
     def __init__(self, tyro_config: FullSimConfig, terrain_manager: TerrainManager, device: str):
         super().__init__(tyro_config, terrain_manager, device)
+
+        # PiPlus-S uses the identified HT motor model below.  The flag is read by
+        # JointPositionActionTerm so IsaacSim receives position set-points and the
+        # actuator (rather than Holosoma's generic torque path) performs the
+        # delayed PD + torque-speed computation.
+        self.uses_native_pd_actuators = False
 
         # Public interface attribute read across backends (video_recorder, virtual_gantry,
         # simulator_bridge). For IsaacSim it always equals self.sim_device; internal tensor
@@ -400,21 +436,41 @@ class IsaacSim(BaseSimulator):
                     kd_list.append(damping_dict[key])
                     print(f"key: {key}, kp: {stiffness_dict[key]}, kd: {damping_dict[key]}")
 
-        # ImplicitActuatorCfg IdealPDActuatorCfg
-        actuators = {
-            dof_names_list[i]: IdealPDActuatorCfg(
-                joint_names_expr=[dof_names_list[i]],
-                effort_limit=dof_effort_limit_list[i],
-                velocity_limit=dof_vel_limit_list[i],
-                # effort_limit_sim=dof_effort_limit_list[i],
-                # velocity_limit_sim=dof_vel_limit_list[i],
-                stiffness=0,
-                damping=0,
-                armature=dof_armature_list[i],
-                friction=dof_joint_friction_list[i],
-            )
-            for i in range(len(dof_names_list))
-        }
+        # Most Holosoma robots use the generic external PD path.  PiPlus-S is
+        # configured with the HT identified actuator collections so IsaacLab can
+        # apply the same per-physics-step delay and nonlinear torque-speed curve
+        # as HT_lab.
+        # The direct SDK bridge writes already-computed torques and does not
+        # create a JointPositionActionTerm.  Keep the legacy direct-effort
+        # actuator path in that mode; otherwise its stale/default position
+        # target would be combined with the bridge torque by an explicit PD
+        # actuator.  Training/evaluation configs use the native HT path.
+        bridge_enabled = bool(getattr(getattr(self.simulator_config, "bridge", None), "enabled", False))
+        use_native_piplus = self.robot_config.asset.robot_type == "piplus_s" and not bridge_enabled
+        if use_native_piplus:
+            actuators = self._build_piplus_ht_actuators()
+            self.uses_native_pd_actuators = True
+        else:
+            if self.robot_config.asset.robot_type == "piplus_s" and bridge_enabled:
+                logger.warning(
+                    "PiPlus-S native HT actuators are disabled while the SDK bridge is enabled; "
+                    "bridge commands are direct torques."
+                )
+            # ImplicitActuatorCfg IdealPDActuatorCfg
+            actuators = {
+                dof_names_list[i]: IdealPDActuatorCfg(
+                    joint_names_expr=[dof_names_list[i]],
+                    effort_limit=dof_effort_limit_list[i],
+                    velocity_limit=dof_vel_limit_list[i],
+                    # effort_limit_sim=dof_effort_limit_list[i],
+                    # velocity_limit_sim=dof_vel_limit_list[i],
+                    stiffness=0,
+                    damping=0,
+                    armature=dof_armature_list[i],
+                    friction=dof_joint_friction_list[i],
+                )
+                for i in range(len(dof_names_list))
+            }
 
         robot_articulation_config: ArticulationCfg = ARTICULATION_CFG.replace(
             prim_path="/World/envs/env_.*/Robot", spawn=spawn, init_state=init_state, actuators=actuators
@@ -470,6 +526,28 @@ class IsaacSim(BaseSimulator):
                 _hide_prim_subtree(stage_utils.get_current_stage(), terrain_prim_path)
         elif terrain_state.mesh_type in ["trimesh", "load_obj"]:
             self.terrain = self.terrain_manager.get_state("locomotion_terrain").terrain
+            if terrain_state.mesh_type == "load_obj":
+                # IsaacLab's InteractiveScene lays environments out using its
+                # own env_spacing grid.  The shared Terrain object was created
+                # earlier and its legacy OBJ tiling (10x20 compact tiles) does
+                # not match that grid; with thousands of environments, most
+                # robots would otherwise have no ground beneath them.  Build
+                # one copy of the source OBJ at every actual scene origin and
+                # refresh the Warp mesh used by height queries.
+                layout_obj = getattr(terrain_state, "layout_load_obj_at_env_origins", None)
+                if not callable(layout_obj):
+                    raise RuntimeError("load_obj terrain term cannot align its mesh with IsaacSim scene origins")
+                # InteractiveScene populates ``env_origins`` only inside
+                # clone_environments(), which happens after this terrain prim
+                # is authored.  Ask the same GridCloner for its transforms now;
+                # the later clone call reuses these cached transforms.
+                scene_origins, _ = self.scene.cloner.get_clone_transforms(self.scene.cfg.num_envs)
+                scene_origins = torch.as_tensor(scene_origins, device=self.sim_device, dtype=torch.float32)
+                layout_obj(scene_origins)
+                logger.info(
+                    f"Aligned load_obj terrain with {self.scene.cfg.num_envs} IsaacSim scene origins "
+                    f"(env_spacing={self.scene.cfg.env_spacing:.3f} m)"
+                )
             visual_material = sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.0, 0.0))
             physics_material = sim_utils.RigidBodyMaterialCfg(
                 static_friction=terrain_state.static_friction,
@@ -495,6 +573,15 @@ class IsaacSim(BaseSimulator):
         # all envs inherit it (the clone copies env_0's authored prim). Authors the combine modes too
         # (see _bind_robot_link_material). No-op unless link_physics.isaacsim is set.
         self._bind_robot_link_material()
+
+        # Author selected within-robot collision filters on env_0 before cloning.
+        # PiPlus-S uses this for the upper-arm/wrist approximation pairs whose
+        # cylinder-to-capsule end caps overlap at every pose.
+        _apply_self_collision_filter_pairs(
+            stage_utils.get_current_stage(),
+            "/World/envs/env_0/Robot",
+            robot_asset_cfg.self_collision_filter_pairs,
+        )
 
         print_prim_tree("/World/envs/env_0/Robot")
         log_robot_properties("/World/envs/env_0/Robot", "*")
@@ -530,6 +617,124 @@ class IsaacSim(BaseSimulator):
         # Register the TiledCameras (built pre-clone above) into the shared SensorManager. Done
         # here at the end of scene build (IsaacSim builds its scene in __init__, not load_assets).
         self._create_sensors()
+
+    def _build_piplus_ht_actuators(self):
+        """Build PiPlus-S actuator groups from HT_lab's 0W asset.
+
+        The group boundaries intentionally match HT_lab's configuration: the
+        legs, hip-pitch, feet, and arms each receive an independent 0--3 physics
+        step delay, while the head is an ideal 3536 actuator with no delay or
+        nonlinear HT curve.  ``effort_limit_sim`` is the PhysX safety limit;
+        ``max_torque`` is the identified motor curve's stall limit.
+        """
+
+        from holosoma.simulator.isaacsim.ht_motor import HTMotorCfg
+
+        if HTMotorCfg is None:  # pragma: no cover - only possible without IsaacLab
+            raise RuntimeError("HTMotorCfg could not be imported; start IsaacSim before building PiPlus actuators")
+
+        stiffness = self.robot_config.control.stiffness
+        damping = self.robot_config.control.damping
+
+        def cfg(
+            joint_names: list[str],
+            *,
+            kp_key: str,
+            kd_key: str,
+            armature: float,
+            effort_limit_sim: float,
+            curve_a: float,
+            curve_b: float,
+            curve_c: float,
+            max_torque: float,
+            max_velocity: float,
+            max_delay: int,
+            use_curve: bool = True,
+        ):
+            return HTMotorCfg(
+                joint_names_expr=joint_names,
+                # The identified max_torque/curve is the actuator-model limit;
+                # this is the independent PhysX solver limit.
+                effort_limit_sim=effort_limit_sim,
+                # HT_lab uses 60 rad/s as the solver-side velocity limit; the
+                # identified no-load speed is kept separately in max_velocity.
+                velocity_limit=60.0,
+                velocity_limit_sim=60.0,
+                stiffness=stiffness[kp_key],
+                damping=damping[kd_key],
+                armature=armature,
+                friction=0.0,
+                min_delay=0,
+                max_delay=max_delay,
+                curve_param_a=curve_a,
+                curve_param_b=curve_b,
+                curve_param_c=curve_c,
+                max_torque=max_torque,
+                max_velocity=max_velocity,
+                use_torque_speed_curve=use_curve,
+                saturation_effort=max_torque,
+            )
+
+        # HTMotorCfg_5036: legs/hip-pitch/feet.
+        legs_5036 = dict(
+            curve_a=-0.006667,
+            curve_b=-0.113990,
+            curve_c=7.732552,
+            max_torque=23.7,
+            max_velocity=7.95,
+        )
+        # HTMotorCfg_4438: arms.
+        arms_4438 = dict(
+            curve_a=-0.128416,
+            curve_b=-0.699618,
+            curve_c=19.833274,
+            max_torque=10.0,
+            max_velocity=20.0,
+        )
+
+        return {
+            "legs": cfg(
+                [
+                    "l_thigh_joint", "r_thigh_joint",
+                    "l_hip_roll_joint", "r_hip_roll_joint",
+                    "l_calf_joint", "r_calf_joint",
+                ],
+                kp_key="thigh", kd_key="thigh", armature=0.013212,
+                effort_limit_sim=23.7, max_delay=3, **legs_5036,
+            ),
+            "hip_pitch": cfg(
+                ["l_hip_pitch_joint", "r_hip_pitch_joint"],
+                kp_key="hip_pitch", kd_key="hip_pitch", armature=0.013212,
+                effort_limit_sim=23.7, max_delay=3, **legs_5036,
+            ),
+            "feet": cfg(
+                [
+                    "l_ankle_pitch_joint", "r_ankle_pitch_joint",
+                    "l_ankle_roll_joint", "r_ankle_roll_joint",
+                ],
+                kp_key="ankle_pitch", kd_key="ankle_pitch", armature=0.013212,
+                effort_limit_sim=23.7, max_delay=3, **legs_5036,
+            ),
+            "head": ImplicitActuatorCfg(
+                joint_names_expr=["head_yaw_joint", "head_pitch_joint"],
+                effort_limit_sim=3.0,
+                velocity_limit_sim=60.0,
+                stiffness=stiffness["head_yaw"],
+                damping=damping["head_yaw"],
+                armature=0.001976,
+                friction=0.0,
+            ),
+            "arms": cfg(
+                [
+                    "l_shoulder_pitch_joint", "r_shoulder_pitch_joint",
+                    "l_shoulder_roll_joint", "r_shoulder_roll_joint",
+                    "l_upper_arm_joint", "r_upper_arm_joint",
+                    "l_elbow_joint", "r_elbow_joint",
+                ],
+                kp_key="shoulder_pitch", kd_key="shoulder_pitch", armature=0.008234,
+                effort_limit_sim=20.0, max_delay=3, **arms_4438,
+            ),
+        }
 
     # ----- Camera sensors (TiledCamera; child prim of the mount body, auto-follow) -----
 
@@ -1047,7 +1252,128 @@ class IsaacSim(BaseSimulator):
             self.contact_forces_history[env_ids, :, :, :] = 0.0
 
     def apply_torques_at_dof(self, torques):
+        # Native HT actuators are driven through position targets by the action
+        # term.  This method is retained for the direct SDK bridge and other
+        # torque-only callers; selecting the legacy actuator collection above
+        # ensures these efforts are not combined with a hidden PD target.
         self._robot.set_joint_effort_target(torques, joint_ids=self.dof_ids)
+
+    def apply_position_targets_at_dof(self, targets, feedforward_efforts=None):
+        """Set joint position targets for a native IsaacLab actuator model.
+
+        ``targets`` follows Holosoma's canonical ``self.dof_names`` order; the
+        configured ``dof_ids`` permutation maps it to IsaacSim's articulation
+        order.  Optional feed-forward efforts are written alongside the target
+        so an actuator can add residual torques before applying its own model.
+        """
+        self._robot.set_joint_position_target(targets, joint_ids=self.dof_ids)
+        # The effort target buffer is persistent inside IsaacLab.  Always write
+        # it, including the no-feed-forward case, so a residual-force command
+        # from a previous step (or before a reset) cannot leak into the next
+        # HTMotor computation.
+        efforts = torch.zeros_like(targets) if feedforward_efforts is None else feedforward_efforts
+        # Explicit HT groups also consume velocity targets.  Holosoma's joint
+        # position action has no desired velocity, so write zeros every time to
+        # prevent a value left by another caller from entering the D term.
+        self._robot.set_joint_velocity_target(torch.zeros_like(targets), joint_ids=self.dof_ids)
+        self._robot.set_joint_effort_target(efforts, joint_ids=self.dof_ids)
+
+    def reset_actuators(self, env_ids=None):
+        """Reset IsaacLab actuator state for Holosoma manager-level resets."""
+        if hasattr(self, "_robot"):
+            # IsaacLab's reset accepts any integer sequence, while its target
+            # setters require a tensor when a subset of environments is given.
+            reset_ids = env_ids
+            if isinstance(env_ids, slice):
+                reset_ids = torch.arange(self.num_envs, dtype=torch.long, device=self.sim_device)[env_ids]
+            elif isinstance(env_ids, torch.Tensor):
+                reset_ids = env_ids.to(device=self.sim_device, dtype=torch.long).reshape(-1)
+            elif env_ids is not None and not isinstance(env_ids, torch.Tensor):
+                reset_ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.sim_device).reshape(-1)
+            if isinstance(reset_ids, torch.Tensor) and reset_ids.numel() == 0:
+                return
+            self._robot.reset(reset_ids)
+            # Articulation.reset() resets actuator state but intentionally leaves
+            # command buffers untouched.  Clear all three command channels for
+            # the reset environments; the next action writes fresh targets.
+            if reset_ids is None:
+                zero = torch.zeros_like(self._robot.data.joint_pos_target)
+            else:
+                zero = torch.zeros(
+                    (len(reset_ids), self._robot.data.joint_pos_target.shape[1]),
+                    dtype=self._robot.data.joint_pos_target.dtype,
+                    device=self._robot.data.joint_pos_target.device,
+                )
+            self._robot.set_joint_position_target(zero, joint_ids=slice(None), env_ids=reset_ids)
+            self._robot.set_joint_velocity_target(zero, joint_ids=slice(None), env_ids=reset_ids)
+            self._robot.set_joint_effort_target(zero, joint_ids=slice(None), env_ids=reset_ids)
+
+    def update_native_actuator_gains(self, kp_scale: torch.Tensor, kd_scale: torch.Tensor) -> None:
+        """Apply Holosoma per-environment PD scales to native IsaacLab actuators.
+
+        The action manager keeps gains in Holosoma's canonical DOF order while
+        IsaacLab actuator groups use articulation order.  Convert through the
+        inverse ``dof_ids`` permutation and update each group's tensors.  For
+        implicit groups (the PiPlus head), also write the gains into PhysX;
+        explicit HTMotor groups consume the tensors in their next ``compute``.
+        """
+        if not self.uses_native_pd_actuators or not hasattr(self, "_robot"):
+            return
+
+        if kp_scale.ndim != 2 or kd_scale.ndim != 2:
+            raise ValueError("Native actuator gain scales must have shape [num_envs, num_dof].")
+        if kp_scale.shape != kd_scale.shape or kp_scale.shape[0] != self.num_envs:
+            raise ValueError(
+                "Native actuator gain scales must have matching shapes with the simulator environment batch."
+            )
+        if kp_scale.shape[1] != self.num_dof:
+            raise ValueError(
+                f"Native actuator gain scales have {kp_scale.shape[1]} DOFs; expected {self.num_dof}."
+            )
+
+        kp_scale = kp_scale.to(device=self.sim_device, dtype=torch.float32)
+        kd_scale = kd_scale.to(device=self.sim_device, dtype=torch.float32)
+        # Gain randomization tensors are shared with the action term and may be
+        # passed here at every control frame.  Avoid a PhysX/CPU property write
+        # when neither tensor changed.
+        last_kp = getattr(self, "_native_last_kp_scale", None)
+        last_kd = getattr(self, "_native_last_kd_scale", None)
+        if last_kp is not None and last_kd is not None and torch.equal(kp_scale, last_kp) and torch.equal(kd_scale, last_kd):
+            return
+
+        # Cache the unscaled values once.  The actuator objects own tensors
+        # shaped [num_envs, group_joints], so retaining a clone avoids compounding
+        # scales when this method is called at every control frame.
+        if not hasattr(self, "_native_actuator_base_gains"):
+            self._native_actuator_base_gains = {
+                name: (actuator.stiffness.clone(), actuator.damping.clone())
+                for name, actuator in self._robot.actuators.items()
+            }
+
+        dof_ids = torch.as_tensor(self.dof_ids, dtype=torch.long, device=self.sim_device)
+        canonical_by_articulation = torch.empty_like(dof_ids)
+        canonical_by_articulation[dof_ids] = torch.arange(self.num_dof, device=self.sim_device)
+
+        for name, actuator in self._robot.actuators.items():
+            joint_ids = actuator.joint_indices
+            if isinstance(joint_ids, slice):
+                articulation_ids = torch.arange(self.num_dof, device=self.sim_device)[joint_ids]
+            else:
+                articulation_ids = torch.as_tensor(joint_ids, dtype=torch.long, device=self.sim_device)
+            canonical_ids = canonical_by_articulation[articulation_ids]
+            base_stiffness, base_damping = self._native_actuator_base_gains[name]
+            actuator.stiffness[:] = base_stiffness * kp_scale[:, canonical_ids]
+            actuator.damping[:] = base_damping * kd_scale[:, canonical_ids]
+
+            # Explicit actuators have solver-side stiffness/damping set to zero
+            # during Articulation initialization.  Only implicit groups should
+            # receive their scaled gains in PhysX.
+            if getattr(actuator, "is_implicit_model", False):
+                self._robot.write_joint_stiffness_to_sim(actuator.stiffness, joint_ids=joint_ids)
+                self._robot.write_joint_damping_to_sim(actuator.damping, joint_ids=joint_ids)
+
+        self._native_last_kp_scale = kp_scale.clone()
+        self._native_last_kd_scale = kd_scale.clone()
 
     def draw_debug_viz(self):
         if self.virtual_gantry:

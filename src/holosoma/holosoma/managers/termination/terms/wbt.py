@@ -25,6 +25,32 @@ def motion_ends(env, **_) -> torch.Tensor:
     return motion_command.time_steps >= motion_command.motion.time_step_total - 2
 
 
+class BodyContact(TerminationTermBase):
+    """Terminate when any selected robot body exceeds a contact-force threshold."""
+
+    def __init__(self, cfg: TerminationTermCfg, env: WholeBodyTrackingManager):
+        super().__init__(cfg, env)
+        self.body_names = list(cfg.params["body_names"])
+        self.force_threshold = float(cfg.params.get("force_threshold", 1.0))
+        missing = [name for name in self.body_names if name not in env.simulator.body_names]
+        if missing:
+            raise ValueError(f"BodyContact cannot find robot bodies: {missing}")
+        self.body_indices = torch.tensor(
+            [env.simulator.body_names.index(name) for name in self.body_names],
+            dtype=torch.long,
+            device=env.device,
+        )
+
+    def __call__(self, env: Any, **kwargs) -> torch.Tensor:
+        # Use contact history so a brief impact between control steps is not
+        # lost before termination is evaluated.
+        forces = env.simulator.contact_forces_history[:, :, self.body_indices, :]
+        return torch.any(torch.norm(forces, dim=-1) > self.force_threshold, dim=(1, 2))
+
+    def reset(self, env_ids: torch.Tensor | None = None) -> None:
+        pass
+
+
 class BadTracking(TerminationTermBase):
     """Terminate if the tracking is bad.
 

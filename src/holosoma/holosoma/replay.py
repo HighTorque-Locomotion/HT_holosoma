@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 from holosoma.config_types.env import get_tyro_env_config
 from holosoma.config_types.experiment import ExperimentConfig
 from holosoma.utils.eval_utils import (
@@ -23,10 +25,26 @@ def replay(tyro_config: ExperimentConfig):
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     env = get_class(env_target)(tyro_env_config, device=device)
 
+    motion_command = env.command_manager.get_state("motion_command")
+    frame_dt = 1.0 / float(motion_command.motion.fps)
+    next_frame_time = time.perf_counter()
     done = False
     while not done:
-        env.simulator.sim.step()
+        # Motion replay is kinematic: ``step_visualize_motion`` writes the
+        # reference root/joint state, runs forward kinematics, and renders it.
+        # Advancing physics here first made every displayed frame alternate
+        # between a gravity/contact/actuator-integrated pose and the exact next
+        # reference pose, which appeared as high-frequency twitching.
         done = env.step_visualize_motion(None)  # type: ignore[attr-defined]
+        next_frame_time += frame_dt
+        now = time.perf_counter()
+        remaining = next_frame_time - now
+        if remaining > 0.0:
+            time.sleep(remaining)
+        elif remaining < -frame_dt:
+            # Rendering/debugging can pause for longer than a frame.  Drop the
+            # stale wall-clock deadline without skipping any motion frames.
+            next_frame_time = now
 
     close_simulation_app(simulation_app)
 

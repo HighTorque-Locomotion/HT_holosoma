@@ -103,6 +103,14 @@ class MotionConfig:
     use_adaptive_timesteps_sampler: bool = False
     """During training, whether to prioritize training on motion segments where the robot fails often."""
 
+    adaptive_uniform_ratio: float = 0.1
+    """Minimum uniform mass used by the adaptive timestep sampler.
+
+    A larger value prevents a failure-prioritized sampler from collapsing onto a
+    single late-motion bin before the policy has learned the clip's initial
+    transition.
+    """
+
     start_at_timestep_zero_prob: float = 0.0
     """Probability of starting at timestep zero."""
 

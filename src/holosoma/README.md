@@ -84,7 +84,7 @@ python src/holosoma/holosoma/train_agent.py \
 
 Train robots to track full-body motion sequences.
 
-**Note**: Currently only supported for Unitree G1 / IsaacSim.
+**Note**: The manager-based WBT presets currently target Unitree G1 and PiPlus-S on IsaacSim.
 
 ```bash
 # G1 with FastSAC
@@ -115,6 +115,19 @@ python src/holosoma/holosoma/replay.py \
 ```
 
 Once checkpoints are saved, you can evaluate policies using [In-Training Evaluation](#in-training-evaluation) (same simulator as training) or cross-simulator evaluation in MuJoCo (see [holosoma_inference](../holosoma_inference/README.md)).
+
+### PiPlus-S HT motor path
+
+The `piplus-s-wbt` IsaacSim preset uses the identified HT actuator model from the HT_lab 0W asset.  The leg, hip-pitch, and foot groups use the HT5036 curve (`23.7 N·m`, `7.95 rad/s`); the arm group uses the HT4438 curve (`10 N·m`, `20 rad/s`).  These four explicit groups draw an independent `0..3` physics-step command delay at reset.  The two head joints retain the source's implicit 3536 actuator (`3 N·m` solver cap, no HT curve/delay).
+
+```bash
+source scripts/source_isaacsim_setup.sh
+python src/holosoma/holosoma/train_agent.py \
+    exp:piplus-s-wbt simulator:isaacsim logger:disabled \
+    --training.num-envs=2048
+```
+
+The native actuator path is used for manager-based training/evaluation.  If the SDK bridge is enabled (the `run_sim.py` preset enables it by default), Holosoma intentionally keeps the direct-torque path so bridge torque is not combined with a second PD controller.  The HT_lab class did not call its parent `DelayedPDActuator.compute`; this port does, so the configured delay is active.  For the final curve-clipped torque, inspect IsaacLab's `simulator._robot.data.applied_torque` (the action term's `torques` buffer is the nominal pre-curve diagnostic).
 
 ---
 

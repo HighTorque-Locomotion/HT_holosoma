@@ -11,11 +11,10 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from loguru import logger
-
 from holosoma.agents.callbacks.base_callback import RLEvalCallback
 from holosoma.config_types.eval_callback import RecordingConfig
 from holosoma.utils.safe_torch_import import torch
+from loguru import logger
 
 
 class EvalRecordingCallback(RLEvalCallback):
@@ -94,6 +93,7 @@ class EvalRecordingCallback(RLEvalCallback):
             "dof_pos",
             "dof_vel",
             "torques",
+            "actuator_torques",
             "torques_substep",
             "dof_pos_substep",
             "dof_vel_substep",
@@ -104,6 +104,14 @@ class EvalRecordingCallback(RLEvalCallback):
             "root_ang_vel",
             "body_pos_w",
             "body_quat_xyzw",
+            "contact_forces",
+            "motion_time_step",
+            "motion_root_pos",
+            "motion_body_pos_w",
+            "motion_joint_pos",
+            "motion_joint_vel",
+            "episode_length",
+            "reset",
             "commanded_velocity",
         ]
         for name in channel_names:
@@ -124,6 +132,10 @@ class EvalRecordingCallback(RLEvalCallback):
         self._buffers["torques"].append(
             _to_np(self._extract_torques(env, eid))
         )  # pre_eval_env_step, so the torques is the last decimation
+        # IsaacSim exposes the post-actuator effort after HTMotor delay and
+        # torque-speed clipping.  Keep this separate from the Holosoma-side
+        # nominal PD torque above so actuator issues are diagnosable.
+        self._buffers["actuator_torques"].append(_to_np(self._extract_actuator_torques(env, eid)))
 
         # robot_root_states: [num_envs, 13] = pos(3), quat_xyzw(4), lin_vel(3), ang_vel(3)
         root = sim.robot_root_states[eid]
@@ -134,6 +146,21 @@ class EvalRecordingCallback(RLEvalCallback):
 
         self._buffers["body_pos_w"].append(_to_np(sim._rigid_body_pos[eid]))
         self._buffers["body_quat_xyzw"].append(_to_np(sim._rigid_body_rot[eid]))
+        if hasattr(sim, "contact_forces"):
+            self._buffers["contact_forces"].append(_to_np(sim.contact_forces[eid]))
+
+        # WBT reference clock and poses make it possible to distinguish a
+        # contact failure from the policy simply falling behind the motion.
+        if hasattr(env, "command_manager") and env.command_manager is not None:
+            motion_command = env.command_manager.get_state("motion_command")
+            if motion_command is not None:
+                self._buffers["motion_time_step"].append(_to_np(motion_command.time_steps[eid]))
+                self._buffers["motion_root_pos"].append(_to_np(motion_command.root_pos_w[eid]))
+                self._buffers["motion_body_pos_w"].append(_to_np(motion_command.body_pos_w[eid]))
+                self._buffers["motion_joint_pos"].append(_to_np(motion_command.joint_pos[eid]))
+                self._buffers["motion_joint_vel"].append(_to_np(motion_command.joint_vel[eid]))
+        self._buffers["episode_length"].append(_to_np(env.episode_length_buf[eid]))
+        self._buffers["reset"].append(_to_np(env.reset_buf[eid]))
 
         # substep tensors: [decimation, num_dof] — one row per physics sub-step
         torques_substep, dof_pos_substep, dof_vel_substep = self._extract_substep_data(env, eid)
@@ -177,6 +204,22 @@ class EvalRecordingCallback(RLEvalCallback):
             if hasattr(term, "torques"):
                 return term.torques[env_id]
         raise RuntimeError("No action term with torques found")
+
+    def _extract_actuator_torques(self, env: Any, env_id: int) -> torch.Tensor:
+        """Return the latest effort after the simulator actuator model."""
+        robot = getattr(env.simulator, "_robot", None)
+        data = getattr(robot, "data", None)
+        applied = getattr(data, "applied_torque", None)
+        if isinstance(applied, torch.Tensor):
+            # IsaacLab stores articulation-order efforts; map to Holosoma's
+            # canonical order when the simulator supplies a DOF permutation.
+            dof_ids = getattr(env.simulator, "dof_ids", None)
+            if dof_ids is not None:
+                return applied[env_id, dof_ids]
+            return applied[env_id]
+
+        # Non-IsaacSim backends have no native actuator effort buffer.
+        return self._extract_torques(env, env_id)
 
     def _extract_substep_data(self, env: Any, env_id: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Extract sub-step torques, dof_pos, and dof_vel from the action manager's joint control term.

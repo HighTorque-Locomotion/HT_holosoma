@@ -66,6 +66,14 @@ class JointPositionActionTerm(ActionTermBase):
         self._configure_pd_gains(env)
         self._configure_action_scales(env)
 
+        # IsaacSim can delegate position-control dynamics to a native actuator
+        # model (PiPlus-S uses the HT delayed/nonlinear actuator).  Other
+        # backends retain the historical Holosoma-side torque computation.
+        self._uses_native_pd_actuators = bool(getattr(env.simulator, "uses_native_pd_actuators", False))
+        self.position_targets = torch.zeros_like(self._processed_actions)
+        self._reset_pose_hold_targets = torch.zeros_like(self.position_targets)
+        self._reset_pose_hold_mask = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+
         # Expose references on the environment for backward compatibility
         env.p_gains = self.p_gains
         env.d_gains = self.d_gains
@@ -97,6 +105,10 @@ class JointPositionActionTerm(ActionTermBase):
         # IsaacGym creates randomization buffers before the action manager exists.
         # Once we reach setup(), try attaching any pre-created actuator scales.
         self._attach_actuator_randomizer_scales()
+        # Native IsaacSim actuators own the PD computation.  Push the initial
+        # (usually all-one) scales into those actuator objects after they have
+        # been created by the simulator.
+        self._sync_native_actuator_gains()
 
         enabled, rfi_lim = self.env._pending_torque_rfi
         self.configure_torque_rfi(enabled=enabled, rfi_lim=rfi_lim)
@@ -154,7 +166,11 @@ class JointPositionActionTerm(ActionTermBase):
         ].clone()
 
     def apply_actions(self) -> None:
-        """Apply processed actions by computing and applying torques."""
+        """Apply processed actions through the configured control path."""
+        if self._uses_native_pd_actuators:
+            self._apply_native_position_targets()
+            return
+
         # Compute torques using PD controller
         self.torques[:] = self._compute_torques(self._actions_after_delay)
         # Record sub-step torques/dof_pos/dof_vel
@@ -167,7 +183,70 @@ class JointPositionActionTerm(ActionTermBase):
         # Cache velocities for next derivative computation
         self._prev_dof_vel.copy_(self.env.simulator.dof_vel)
 
-    def _compute_torques(self, actions: torch.Tensor) -> torch.Tensor:
+    def _apply_native_position_targets(self) -> None:
+        """Send position set-points to an IsaacSim actuator model.
+
+        The HTMotor actuator then applies its physics-step delay, computes the
+        PD effort with the configured gains, and applies the identified
+        torque-speed saturation.  This avoids calculating PD twice (once here
+        and once inside IsaacLab).
+        """
+
+        control_type = self.env.robot_config.control.control_type
+        if control_type != "P":
+            raise ValueError("Native IsaacSim actuator models currently require P (position) control.")
+
+        # A custom randomization term may resample gains between environment
+        # steps.  Synchronize once per control frame (this method is called at
+        # every physics substep) before sending the first target.
+        if self._substep_idx == 0:
+            self._sync_native_actuator_gains()
+
+        assert self._actions_after_delay is not None
+        self.position_targets[:] = self._compute_position_targets(self._actions_after_delay)
+        # Boolean indexing is a no-op when no environment is being held; avoid
+        # a host synchronisation from ``torch.any`` on every physics sub-step.
+        self.position_targets[self._reset_pose_hold_mask] = self._reset_pose_hold_targets[
+            self._reset_pose_hold_mask
+        ]
+
+        # Keep the nominal Holosoma-side torque buffer for diagnostics,
+        # termination terms, and trajectory recording.  The actual applied
+        # torque is produced by the IsaacLab actuator after this call.
+        self.torques[:] = self._compute_torques(self._actions_after_delay, include_rfi=False)
+        self.torques_substep[:, self._substep_idx] = self.torques
+        self.dof_pos_substep[:, self._substep_idx] = self.env.simulator.dof_pos
+        self.dof_vel_substep[:, self._substep_idx] = self.env.simulator.dof_vel
+        self._substep_idx += 1
+
+        feedforward = None
+        if self._randomize_torque_rfi:
+            feedforward = self._compute_rfi_torques()
+
+        apply_targets = getattr(self.env.simulator, "apply_position_targets_at_dof", None)
+        if not callable(apply_targets):
+            raise RuntimeError(
+                "The environment requested native actuator PD, but the simulator does not implement "
+                "apply_position_targets_at_dof()."
+            )
+        apply_targets(self.position_targets, feedforward)
+        self._prev_dof_vel.copy_(self.env.simulator.dof_vel)
+
+        # The hold covers every physics sub-step in exactly one control frame.
+        # ``process_actions`` resets ``_substep_idx`` at the next frame.
+        decimation = self.env.simulator.simulator_config.sim.control_decimation_steps
+        if self._substep_idx >= decimation:
+            self._reset_pose_hold_mask.zero_()
+
+    def _compute_position_targets(self, actions: torch.Tensor) -> torch.Tensor:
+        """Convert policy actions to position set-points and apply optional joint limits."""
+        targets = actions * self.action_scales + self.env.default_dof_pos
+        if getattr(self.env.robot_config.control, "clip_position_targets_to_joint_limits", False):
+            limits = self.env.simulator.hard_dof_pos_limits
+            targets = torch.clamp(targets, min=limits[:, 0], max=limits[:, 1])
+        return targets
+
+    def _compute_torques(self, actions: torch.Tensor, *, include_rfi: bool = True) -> torch.Tensor:
         """Compute torques from actions using PD controller.
 
         Args:
@@ -184,8 +263,9 @@ class JointPositionActionTerm(ActionTermBase):
 
         if control_type == "P":
             # Position control
+            position_targets = self._compute_position_targets(actions)
             torques = (
-                self._kp_scale * self.p_gains * (actions_scaled + self.env.default_dof_pos - self.env.simulator.dof_pos)
+                self._kp_scale * self.p_gains * (position_targets - self.env.simulator.dof_pos)
                 - self._kd_scale * self.d_gains * self.env.simulator.dof_vel
             )
         elif control_type == "V":
@@ -201,17 +281,23 @@ class JointPositionActionTerm(ActionTermBase):
             raise ValueError(f"Unknown controller type: {control_type}")
 
         # Apply torque randomization if configured
-        if self._randomize_torque_rfi:
-            torques = (
-                torques
-                + (torch.rand_like(torques) * 2.0 - 1.0) * self._rfi_lim * self._rfi_lim_scale * self.env.torque_limits
-            )
+        if include_rfi and self._randomize_torque_rfi:
+            torques = torques + self._compute_rfi_torques()
 
         # Clip torques if configured
         if self.env.robot_config.control.clip_torques:
             torques = torch.clip(torques, -self.env.torque_limits, self.env.torque_limits)
 
         return torques
+
+    def _compute_rfi_torques(self) -> torch.Tensor:
+        """Draw residual force-injection torques for the native actuator path."""
+        return (
+            (torch.rand_like(self.torques) * 2.0 - 1.0)
+            * self._rfi_lim
+            * self._rfi_lim_scale
+            * self.env.torque_limits
+        )
 
     def reset(self, env_ids: torch.Tensor | None = None) -> None:
         """Reset action term state.
@@ -231,14 +317,47 @@ class JointPositionActionTerm(ActionTermBase):
         # Reset torques
         if env_ids is None:
             self.torques.zero_()
+            self._actions_after_delay.zero_()
+            self.position_targets.zero_()
+            self._reset_pose_hold_targets.zero_()
+            self._reset_pose_hold_mask.zero_()
         else:
             self.torques[env_ids] = 0.0
+            self._actions_after_delay[env_ids] = 0.0
+            self.position_targets[env_ids] = 0.0
+            self._reset_pose_hold_targets[env_ids] = 0.0
+            self._reset_pose_hold_mask[env_ids] = False
 
         # Reset cached velocities
         if env_ids is None:
             self._prev_dof_vel.zero_()
         else:
             self._prev_dof_vel[env_ids] = 0.0
+
+        # IsaacLab does not receive Holosoma's manager-level reset callback
+        # automatically.  Resetting here clears HTMotor DelayBuffers and draws
+        # a fresh per-environment 0..3 physics-step lag.
+        if self._uses_native_pd_actuators:
+            reset_actuators = getattr(self.env.simulator, "reset_actuators", None)
+            if callable(reset_actuators):
+                reset_actuators(env_ids)
+
+    def hold_reset_pose_for_next_control_frame(self, env_ids: torch.Tensor | None = None) -> None:
+        """Keep reset joint positions during the next native-PD control frame.
+
+        This is used only by WBT's initial zero-action bootstrap step.  Raw and
+        processed actions remain zero, so the observation/action history keeps
+        its usual reset semantics.
+        """
+        if not self._uses_native_pd_actuators:
+            return
+
+        if env_ids is None:
+            self._reset_pose_hold_targets.copy_(self.env.simulator.dof_pos)
+            self._reset_pose_hold_mask.fill_(True)
+        else:
+            self._reset_pose_hold_targets[env_ids] = self.env.simulator.dof_pos[env_ids]
+            self._reset_pose_hold_mask[env_ids] = True
 
     # ------------------------------------------------------------------
     # Hooks for randomization manager
@@ -296,6 +415,14 @@ class JointPositionActionTerm(ActionTermBase):
             return
 
         self.attach_actuator_scales(state.kp_scale_tensor, state.kd_scale_tensor, state.rfi_lim_scale_tensor)
+
+    def _sync_native_actuator_gains(self) -> None:
+        """Synchronize Holosoma gain scales with IsaacLab's native actuators."""
+        if not self._uses_native_pd_actuators:
+            return
+        updater = getattr(self.env.simulator, "update_native_actuator_gains", None)
+        if callable(updater):
+            updater(self._kp_scale, self._kd_scale)
 
     def _configure_pd_gains(self, env: Any) -> None:
         control_cfg = env.robot_config.control

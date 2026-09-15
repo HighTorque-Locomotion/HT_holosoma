@@ -482,14 +482,28 @@ class AdaptiveTimestepsSampler:
 
     @property
     def sampling_probabilities(self) -> torch.Tensor:
-        sampling_probabilities = self.bin_failed_count + self.adaptive_uniform_ratio / float(self.num_bins)
+        # Smooth failure counts first, then mix a true uniform distribution into
+        # the normalized adaptive distribution.  The previous implementation
+        # added ``uniform_ratio / num_bins`` as a pseudo-count; after a few
+        # thousand resets the failure counts dominated it and the nominal
+        # uniform ratio effectively became zero (observed top-bin probability
+        # reached 0.88 for PiPlus-S).
+        sampling_probabilities = self.bin_failed_count
         sampling_probabilities = torch.nn.functional.pad(
             sampling_probabilities.unsqueeze(0).unsqueeze(0),
             (0, self.adaptive_kernel_size - 1),  # Non-causal kernel
             mode="replicate",
         )
         sampling_probabilities = torch.nn.functional.conv1d(sampling_probabilities, self.kernel.view(1, 1, -1)).view(-1)
-        return sampling_probabilities / sampling_probabilities.sum()
+        uniform = torch.full_like(sampling_probabilities, 1.0 / float(self.num_bins))
+        adaptive_total = sampling_probabilities.sum()
+        adaptive_probabilities = torch.where(
+            adaptive_total > 0.0,
+            sampling_probabilities / adaptive_total.clamp_min(torch.finfo(sampling_probabilities.dtype).eps),
+            uniform,
+        )
+        uniform_ratio = float(np.clip(self.adaptive_uniform_ratio, 0.0, 1.0))
+        return (1.0 - uniform_ratio) * adaptive_probabilities + uniform_ratio * uniform
 
     def sample(self, num_samples: int) -> torch.Tensor:
         sampled_bins = torch.multinomial(self.sampling_probabilities, num_samples, replacement=True)
@@ -578,6 +592,24 @@ class MotionCommand(CommandTermBase):
                 device=self.device,
             )
 
+        motion_fps = float(self.motion.fps)
+        if motion_fps <= 0.0:
+            raise ValueError(f"Motion FPS must be positive, got {motion_fps}.")
+        control_fps = 1.0 / float(self._env.dt)
+        logger.info(
+            "Motion clock: source={:.3f} FPS, control={:.3f} Hz",
+            motion_fps,
+            control_fps,
+        )
+        if not np.isclose(motion_fps, control_fps):
+            logger.warning(
+                "Motion FPS ({:.3f}) does not match the WBT control rate ({:.3f} Hz). "
+                "MotionCommand advances one frame per control step; resample the motion "
+                "during data conversion to preserve its speed.",
+                motion_fps,
+                control_fps,
+            )
+
         # Store body and joint indexes for interpolation
         self._body_indexes_in_motion = self.motion._body_indexes
         self._joint_indexes_in_motion = self.motion._joint_indexes
@@ -606,7 +638,10 @@ class MotionCommand(CommandTermBase):
         # 4. get the adaptive timesteps sampler
         if self.motion_cfg.use_adaptive_timesteps_sampler:
             self.adaptive_timesteps_sampler = AdaptiveTimestepsSampler(
-                self.motion.time_step_total, self.device, int(1 / (self._env.dt))
+                self.motion.time_step_total,
+                self.device,
+                int(1 / (self._env.dt)),
+                adaptive_uniform_ratio=float(self.motion_cfg.adaptive_uniform_ratio),
             )
 
         # 5. metrics
@@ -688,7 +723,6 @@ class MotionCommand(CommandTermBase):
         # Otherwise, update_tasks_callback will advance the timestep to the next timestep -> out of bounds error.
         already_last_timestep_mask = self.time_steps[env_ids] >= end_idx - 1
         self.time_steps[env_ids] = torch.where(already_last_timestep_mask, end_idx - 2, self.time_steps[env_ids])
-
         # 1. Get the root/body poses from the motion data
         root_pos = self.root_pos_w[env_ids].clone()
         root_rot = self.root_quat_w[env_ids].clone()
@@ -794,7 +828,8 @@ class MotionCommand(CommandTermBase):
 
     def step(self) -> None:
         """called in _update_tasks_callback of the environment. (after compute_reward, before compute_observations)"""
-        # 0. update time steps, all motion joint/body poses are updated automatically with the time steps.
+        # 0. Update one source frame per control step. Motion conversion must
+        # resample clips to the environment control rate before training.
         advance_mask = torch.ones_like(self.time_steps, dtype=torch.bool)
 
         # Handle freeze_at_timestep_zero_prob: for envs at their motion's start, randomly decide whether to advance
@@ -820,6 +855,12 @@ class MotionCommand(CommandTermBase):
             sim = self._env.simulator
             sim.set_actor_root_state_tensor_robots(ended_env_ids, sim.robot_root_states)
             sim.set_dof_state_tensor_robots(ended_env_ids, sim.dof_state)  # type: ignore[attr-defined]
+            # Motion clips can restart inside an episode, bypassing the normal
+            # BaseTask/action-manager reset path.  Clear and re-sample any
+            # IsaacSim actuator delay buffers at this boundary as well.
+            reset_actuators = getattr(sim, "reset_actuators", None)
+            if callable(reset_actuators):
+                reset_actuators(ended_env_ids)
             sim.refresh_sim_tensors()
 
         # 1. update body_pos_relative_w and body_quat_relative_w

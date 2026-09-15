@@ -109,6 +109,26 @@ def motion_global_body_ang_vel(env: WholeBodyTrackingManager, sigma: float) -> t
     return torch.exp(-error.mean(-1) / sigma**2)
 
 
+def motion_joint_pos_error_exp(env: WholeBodyTrackingManager, sigma: float) -> torch.Tensor:
+    """Dense joint-position tracking reward.
+
+    Body-link rewards do not uniquely constrain every revolute joint (especially on
+    serial arms), so a policy can obtain a reasonable link pose while leaving
+    individual joints far from the reference.  Averaging over joints keeps this
+    term comparable across robots with different DOF counts.
+    """
+    motion_command = _get_motion_command_and_assert_type(env)
+    error = torch.square(motion_command.joint_pos - motion_command.robot_joint_pos).mean(dim=-1)
+    return torch.exp(-error / sigma**2)
+
+
+def motion_joint_vel_error_exp(env: WholeBodyTrackingManager, sigma: float) -> torch.Tensor:
+    """Dense joint-velocity tracking reward, averaged over all actuated joints."""
+    motion_command = _get_motion_command_and_assert_type(env)
+    error = torch.square(motion_command.joint_vel - motion_command.robot_joint_vel).mean(dim=-1)
+    return torch.exp(-error / sigma**2)
+
+
 # ================================================================================================
 # Object Tracking Rewards
 # ================================================================================================

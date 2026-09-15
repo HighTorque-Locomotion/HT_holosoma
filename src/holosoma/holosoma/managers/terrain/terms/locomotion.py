@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any, Tuple
 
+import numpy as np
+
 from holosoma.managers.terrain.base import TerrainTermBase
 from holosoma.simulator.shared.terrain import Terrain
 from holosoma.utils import draw, warp_utils
@@ -58,6 +60,36 @@ class TerrainLocomotion(TerrainTermBase):
     @property
     def warp_mesh(self):
         return self._warp_mesh
+
+    def layout_load_obj_at_env_origins(self, env_origins) -> None:
+        """Align a loaded OBJ terrain with IsaacSim's actual scene origins.
+
+        ``InteractiveScene`` owns the environment grid on IsaacSim and can use
+        a spacing that is unrelated to the shared terrain tile grid.  Rebuild
+        both the simulator mesh and the Warp query mesh from one OBJ copy per
+        scene origin so collision, height scans, and spawn-height queries see
+        the same terrain.
+        """
+        if self.mesh_type != "load_obj":
+            return
+
+        if hasattr(env_origins, "detach"):
+            origins_np = env_origins.detach().cpu().numpy()
+        else:
+            origins_np = np.asarray(env_origins)
+
+        self._terrain.layout_load_obj_at_origins(origins_np)
+        if origins_np.shape[0] != self.num_envs:
+            raise ValueError(
+                f"IsaacSim scene has {origins_np.shape[0]} origins but terrain term has {self.num_envs} environments"
+            )
+        # Keep the shared API consistent with the world-space scene grid.  The
+        # IsaacSim backend uses scene.env_origins for motion data and placement,
+        # but other consumers may still read terrain_state.env_origins.
+        self._env_origins[:] = torch.as_tensor(origins_np, device=self.device, dtype=torch.float32)
+        self._warp_mesh = warp_utils.convert_to_wp_mesh(
+            self._terrain.mesh.vertices, self._terrain.mesh.faces, self.device
+        )
 
     def setup(self) -> None:
         self._base_heights = torch.zeros(self.num_envs, device=self.device, requires_grad=False)
@@ -120,7 +152,18 @@ class TerrainLocomotion(TerrainTermBase):
             self._env_origins[:] = torch.from_numpy(self.terrain.sample_env_origins()).to(self.device).to(torch.float)
         else:
             # Eval mode: all robots at tile (0,0) for deterministic evaluation
-            origin_0_0 = torch.from_numpy(self.terrain._env_origins[0, 0]).to(self.device).to(torch.float)
+            # Procedural terrains expose ``_env_origins`` directly, while OBJ terrains
+            # build their origin grid lazily because the tile extents come from the
+            # loaded mesh.  Use the same deterministic (0, 0) tile for both cases.
+            if hasattr(self.terrain, "_env_origins"):
+                origin_grid = self.terrain._env_origins
+            elif hasattr(self.terrain, "_get_load_obj_env_origin_grid"):
+                origin_grid = self.terrain._get_load_obj_env_origin_grid()
+            else:
+                raise AttributeError(
+                    f"Terrain type {type(self.terrain).__name__} does not expose an environment-origin grid"
+                )
+            origin_0_0 = torch.from_numpy(origin_grid[0, 0]).to(self.device).to(torch.float)
             self._env_origins[:] = origin_0_0  # Broadcast to all robots
 
     def _init_base_height_points(self):

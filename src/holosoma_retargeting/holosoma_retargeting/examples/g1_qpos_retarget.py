@@ -124,6 +124,30 @@ G1_FOOT_CORNER_MOCAP_LINKS: "OrderedDict[str, str]" = OrderedDict(
     ]
 )
 
+# Fixed marker bodies used by the PiPlus interaction-mesh, foot-plane, and
+# foot-sticking terms.  They are kinematic reference points, not additional
+# collision geometry.  Keep these positions in sync with the augmented 260831
+# PiPlus model that established the piplus_s mapping convention.
+PIPLUS_REFERENCE_BODIES: tuple[tuple[str, str, str, str | None], ...] = (
+    ("torso_link", "torso_center_link", "-0.005 0 0.09", "0.012"),
+    ("r_wrist_link", "r_hand_center_link", "0 0 -0.095", None),
+    ("r_wrist_link", "r_hand_tip_contact", "0 0 -0.11", "0.006"),
+    ("l_wrist_link", "l_hand_center_link", "0 0 -0.095", None),
+    ("l_wrist_link", "l_hand_tip_contact", "0 0 -0.11", "0.006"),
+    ("r_ankle_pitch_link", "r_ankle_intermediate_1_link", "0 0 0.03", "0.01"),
+    ("l_ankle_pitch_link", "l_ankle_intermediate_1_link", "0 0 0.03", "0.01"),
+    ("r_ankle_roll_link", "r_foot_contact_toe", "0.055 0 -0.044", "0.005"),
+    ("l_ankle_roll_link", "l_foot_contact_toe", "0.055 0 -0.044", "0.005"),
+    ("r_ankle_roll_link", "r_foot_contact_front_outer", "0.04 -0.025 -0.044", "0.006"),
+    ("r_ankle_roll_link", "r_foot_contact_rear_outer", "-0.07 -0.025 -0.044", "0.006"),
+    ("r_ankle_roll_link", "r_foot_contact_front_inner", "0.04 0.025 -0.044", "0.006"),
+    ("r_ankle_roll_link", "r_foot_contact_rear_inner", "-0.07 0.025 -0.044", "0.006"),
+    ("l_ankle_roll_link", "l_foot_contact_front_outer", "0.04 0.025 -0.044", "0.006"),
+    ("l_ankle_roll_link", "l_foot_contact_rear_outer", "-0.07 0.025 -0.044", "0.006"),
+    ("l_ankle_roll_link", "l_foot_contact_front_inner", "0.04 -0.025 -0.044", "0.006"),
+    ("l_ankle_roll_link", "l_foot_contact_rear_inner", "-0.07 -0.025 -0.044", "0.006"),
+)
+
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -137,6 +161,16 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--piplus-urdf-file", required=True, type=Path)
     parser.add_argument("--piplus-xml-file", required=True, type=Path)
+    parser.add_argument(
+        "--piplus-collision-geometry",
+        choices=("as-is", "raw-mesh"),
+        default="as-is",
+        help=(
+            "Collision geometry used while retargeting. 'raw-mesh' enables each "
+            "robot mesh geom and disables the robot's primitive collision geoms; "
+            "terrain and floor collisions remain enabled."
+        ),
+    )
     parser.add_argument(
         "--save-dir",
         type=Path,
@@ -435,10 +469,50 @@ def _copy_terrain_meshes(
     return copied
 
 
+def _validate_joint_limits_match(piplus_urdf: Path, piplus_xml: Path) -> None:
+    """Fail before retargeting if URDF and MuJoCo joint limits disagree."""
+    urdf_root = ET.parse(piplus_urdf).getroot()
+    xml_root = ET.parse(piplus_xml).getroot()
+
+    urdf_limits: dict[str, tuple[float, float]] = {}
+    for joint in urdf_root.findall(".//joint"):
+        if joint.get("type") in {"fixed", "continuous"}:
+            continue
+        limit = joint.find("limit")
+        name = joint.get("name")
+        if name and limit is not None and limit.get("lower") is not None and limit.get("upper") is not None:
+            urdf_limits[name] = (float(limit.get("lower")), float(limit.get("upper")))
+
+    xml_limits: dict[str, tuple[float, float]] = {}
+    for joint in xml_root.findall(".//worldbody//joint"):
+        name = joint.get("name")
+        value = joint.get("range")
+        if name and value:
+            lower, upper = (float(item) for item in value.split())
+            xml_limits[name] = (lower, upper)
+
+    missing = sorted(set(urdf_limits) - set(xml_limits))
+    mismatched = [
+        (name, urdf_limits[name], xml_limits[name])
+        for name in sorted(set(urdf_limits) & set(xml_limits))
+        if not np.allclose(urdf_limits[name], xml_limits[name], atol=1e-9, rtol=0.0)
+    ]
+    if missing or mismatched:
+        details = []
+        if missing:
+            details.append(f"missing from MuJoCo XML: {', '.join(missing)}")
+        details.extend(
+            f"{name}: URDF={urdf_range}, MuJoCo={xml_range}"
+            for name, urdf_range, xml_range in mismatched
+        )
+        raise ValueError("PiPlus URDF/MuJoCo joint-limit mismatch:\n  " + "\n  ".join(details))
+
+
 def _make_scene_xml(
     piplus_xml: Path,
     parts: list[tuple[str, Path, np.ndarray]],
     output_path: Path,
+    collision_geometry: str = "as-is",
 ) -> Path:
     """Attach each Omni terrain part as a separate MuJoCo mesh geom.
 
@@ -448,6 +522,7 @@ def _make_scene_xml(
     """
     piplus_xml = _resolve_existing(piplus_xml, "PiPlus MuJoCo XML")
     text = piplus_xml.read_text(encoding="utf-8")
+    text = _prepare_piplus_xml(text, collision_geometry)
     asset_end = text.find("</asset>")
     world_match = re.search(r"(<worldbody(?:\s[^>]*)?>)", text)
     if asset_end < 0 or world_match is None:
@@ -478,6 +553,56 @@ def _make_scene_xml(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(text, encoding="utf-8")
     return output_path
+
+
+def _prepare_piplus_xml(text: str, collision_geometry: str) -> str:
+    """Add required reference markers and optionally select raw robot mesh collisions."""
+    root = ET.fromstring(text)
+    robot_root = root.find("./worldbody/body[@name='base_link']")
+    if robot_root is None:
+        raise ValueError("PiPlus XML does not contain worldbody/base_link")
+
+    existing_bodies = {body.get("name") for body in robot_root.iter("body")}
+    for parent_name, marker_name, position, radius in PIPLUS_REFERENCE_BODIES:
+        if marker_name in existing_bodies:
+            continue
+        parent = robot_root if parent_name == "base_link" else robot_root.find(f".//body[@name='{parent_name}']")
+        if parent is None:
+            raise ValueError(f"PiPlus XML does not contain marker parent body {parent_name}")
+        marker = ET.SubElement(parent, "body", name=marker_name, pos=position)
+        if radius is not None:
+            ET.SubElement(
+                marker,
+                "geom",
+                name=marker_name,
+                type="sphere",
+                size=radius,
+                contype="0",
+                conaffinity="0",
+                density="0",
+                rgba="0.2 0.2 0.2 1",
+            )
+        existing_bodies.add(marker_name)
+
+    missing = [
+        body_name
+        for _, body_name, _, _ in PIPLUS_REFERENCE_BODIES
+        if robot_root.find(f".//body[@name='{body_name}']") is None
+    ]
+    if missing:
+        raise ValueError(f"PiPlus XML is missing required reference bodies: {missing}")
+
+    if collision_geometry == "raw-mesh":
+        for body in robot_root.iter("body"):
+            for geom in body.findall("geom"):
+                if geom.get("type", "sphere") == "mesh":
+                    geom.set("contype", "1")
+                    geom.set("conaffinity", "1")
+                else:
+                    geom.set("contype", "0")
+                    geom.set("conaffinity", "0")
+
+    return ET.tostring(root, encoding="unicode")
 
 
 def _make_task_constants(
@@ -581,9 +706,18 @@ def main() -> None:
     _make_terrain_urdf(portable_parts, terrain_urdf_out)
 
     piplus_xml = _resolve_existing(args.piplus_xml_file, "PiPlus MuJoCo XML")
-    scene_xml_out = piplus_xml.parent / f"{piplus_xml.stem}_with_omniretarget_{args.g1_qpos_npz.stem}.xml"
-    scene_xml = _make_scene_xml(piplus_xml, parts, scene_xml_out)
     piplus_urdf = _resolve_existing(args.piplus_urdf_file, "PiPlus URDF")
+    _validate_joint_limits_match(piplus_urdf, piplus_xml)
+    collision_suffix = "_raw_mesh_collision" if args.piplus_collision_geometry == "raw-mesh" else ""
+    scene_xml_out = piplus_xml.parent / (
+        f"{piplus_xml.stem}{collision_suffix}_with_omniretarget_{args.g1_qpos_npz.stem}.xml"
+    )
+    scene_xml = _make_scene_xml(
+        piplus_xml,
+        parts,
+        scene_xml_out,
+        collision_geometry=args.piplus_collision_geometry,
+    )
     constants = _make_task_constants(piplus_urdf, scene_xml, scene_xml)
     retargeter = _build_retargeter(constants, terrain_urdf_out, args)
 
@@ -626,6 +760,7 @@ def main() -> None:
             ),
             "bundle_dir": np.asarray(str(output_dir)),
             "scene_xml": np.asarray(str(scene_xml)),
+            "piplus_collision_geometry": np.asarray(args.piplus_collision_geometry),
             "transfer_scale": np.asarray(transfer_scale, dtype=np.float32),
             "reference_link_names": np.asarray(
                 list(G1_REFERENCE_LINKS.values())
